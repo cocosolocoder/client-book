@@ -79,7 +79,7 @@ th{font-size:.85rem;color:#5b6b7b;font-weight:600}
   <span class="filename" id="filename"></span>
   <div style="margin-top:.75rem"><button type="submit" id="submit-btn">导入</button></div>
 </form>
-<p class="hint">表头须包含 name（必需），可选 source、region、industry、important_date，顺序不限；重要日期须为 YYYY-MM-DD 真实日期。支持带引号字段与字段内换行（UTF-8，可带 BOM）。</p>
+<p class="hint">表头须包含 name（必需），可选 source、region、industry、important_date，顺序不限；重要日期须为 YYYY-MM-DD 真实日期。支持带引号字段与字段内换行（UTF-8，可带 BOM）：双引号只能在字段开头包裹整个字段，字段内双引号须写作一对连续双引号，结束引号后只能紧接逗号、换行或文件结束；违反引号规则、引号未闭合都将整份拒绝。</p>
 <div id="report"></div>
 </section>
 
@@ -333,7 +333,7 @@ document.getElementById("import-form").addEventListener("submit", async e => {
 
 function renderReport(data, status) {
   if (status === 400) {
-    showReport('<div class="banner bad">整份文件已拒绝导入，客户列表保持原样。<br>原因：' +
+    showReport('<div class="banner bad">整份文件已拒绝导入：<b>本次没有新增客户</b>，原有客户资料保持原样，列表未改动。<br>拒绝原因：' +
       esc(data.error || "未知错误") + '</div>');
     return;
   }
@@ -467,25 +467,38 @@ def batch_update_clients(database, payload):
 def parse_csv(text):
     """解析 RFC 4180 风格 CSV，返回 (header, data_rows)。
 
-    支持引号包裹的字段、引号内逗号与换行、双引号转义；
-    引号外支持 LF / CRLF / CR 换行。结构损坏时抛 FileError。
+    双引号只能在字段开头出现并包裹整个字段；未加引号的字段中一旦出现双引号、
+    结束引号后紧跟逗号/记录换行/文件结束以外的字符（含空格），均为结构错误；
+    文件结束时引号字段仍未闭合同样拒绝。结构规则同样适用于表头，一旦发现
+    立即抛 FileError 并指明位置（表头或第几条数据记录），整份文件不导入。
+    支持引号内逗号、换行与双引号转义（""），引号外支持 LF / CRLF / CR 换行，
+    文件末尾无换行、末尾空字段、带引号的空字段均正常处理。
     """
     rows = []
     record = []
     field = []
-    quoted = False
-    started = False
+    # field_start：字段开头；unquoted：无引号字段中；quoted：引号字段中；
+    # quote_end：刚读到结束引号，只允许逗号、记录换行或文件结束
+    state = "field_start"
     i = 0
     n = len(text)
+
+    def location():
+        # 已完成的 rows 中第一条是表头；当前记录的编号即 len(rows)
+        return "表头" if not rows else "第 %d 条数据记录" % len(rows)
+
+    def structure_error(detail):
+        raise FileError("CSV 结构损坏：%s%s" % (location(), detail))
+
     while i < n:
         c = text[i]
-        if quoted:
+        if state == "quoted":
             if c == '"':
                 if i + 1 < n and text[i + 1] == '"':
                     field.append('"')
                     i += 2
                     continue
-                quoted = False
+                state = "quote_end"
                 i += 1
                 continue
             if c == "\r":
@@ -498,32 +511,61 @@ def parse_csv(text):
             field.append(c)
             i += 1
             continue
-        if c == '"' and not started:
-            quoted = True
-            started = True
+
+        if state == "quote_end":
+            if c == ",":
+                record.append("".join(field))
+                field = []
+                state = "field_start"
+                i += 1
+                continue
+            if c in "\r\n":
+                if c == "\r" and i + 1 < n and text[i + 1] == "\n":
+                    i += 1
+                record.append("".join(field))
+                rows.append(record)
+                record = []
+                field = []
+                state = "field_start"
+                i += 1
+                continue
+            structure_error(
+                "的结束引号后存在多余字符：结束引号后只能紧跟逗号、记录换行或文件结束")
+
+        # state 为 field_start 或 unquoted
+        if c == '"':
+            if state == "unquoted":
+                structure_error(
+                    "的未加引号字段中出现双引号：双引号只能在字段开头包裹整个字段"
+                    "（字段内的双引号须写成一对连续双引号）")
+            state = "quoted"
         elif c == ",":
             record.append("".join(field))
             field = []
-            started = False
+            state = "field_start"
         elif c in "\r\n":
-            if c == "\r" and i + 1 < n and text[i + 1] == "\n":
-                i += 1
-            if not started and not record and not field:
-                # 空白行：不作为数据记录（显式的 "" 空字段 started=True，仍会保留）
-                i += 1
-                continue
-            record.append("".join(field))
-            rows.append(record)
-            record = []
-            field = []
-            started = False
+            # 空白行：记录尚未写入任何字段时整体跳过，不计入数据记录编号
+            # （显式的 "" 空字段处于 quote_end 状态，仍会保留为一条记录）
+            if state == "field_start" and not record:
+                if c == "\r" and i + 1 < n and text[i + 1] == "\n":
+                    i += 1
+            else:
+                if c == "\r" and i + 1 < n and text[i + 1] == "\n":
+                    i += 1
+                record.append("".join(field))
+                rows.append(record)
+                record = []
+                field = []
+                state = "field_start"
         else:
             field.append(c)
-            started = True
+            state = "unquoted"
         i += 1
-    if quoted:
-        raise FileError("CSV 结构损坏：存在未闭合的引号")
-    if started or field or record:
+
+    if state == "quoted":
+        structure_error("中的引号字段未闭合：文件结束时仍缺少结束引号")
+    if state != "field_start" or record:
+        # 文件末尾无换行、或末尾是空字段（如 "a,"），补全最后一条记录
         record.append("".join(field))
         rows.append(record)
     if not rows:
