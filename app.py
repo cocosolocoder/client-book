@@ -50,6 +50,13 @@ th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid #e3e8ee;verti
 th{font-size:.85rem;color:#5b6b7b;font-weight:600}
 .muted{color:#9aa7b4}
 .footer{color:#5b6b7b;font-size:.9rem;margin-top:2rem}
+.field-row{display:flex;align-items:center;gap:.6rem;margin:.55rem 0;flex-wrap:wrap}
+.field-label{font-weight:600;min-width:4.5rem}
+.field-value{padding:.35rem .5rem;border:1px solid #c3ccd6;border-radius:4px;font-size:.95rem;min-width:15rem}
+.field-value:disabled{background:#f0f3f6;color:#9aa7b4}
+.selected-info{background:#f0f6fc;border:1px solid #cfe0f0;border-radius:6px;padding:.45rem .75rem;margin:.5rem 0;font-size:.9rem}
+.check-col{width:2.2rem;text-align:center}
+#batch-report{margin-top:1rem}
 </style>
 </head>
 <body>
@@ -68,10 +75,54 @@ th{font-size:.85rem;color:#5b6b7b;font-weight:600}
 <div id="report"></div>
 </section>
 
+<section class="card">
+<h2>批量修改已选客户</h2>
+<p class="hint">在下方客户列表中勾选若干客户，然后在此统一修改来源、地区、行业或重要日期。每位客户以编号识别，名称与编号不参与修改，也不会新建客户。</p>
+<div id="selected-info" class="selected-info">尚未勾选客户。</div>
+<form id="batch-form">
+  <div class="field-row">
+    <span class="field-label">来源</span>
+    <label><input type="radio" name="source-mode" value="keep" checked> 保持原值</label>
+    <label><input type="radio" name="source-mode" value="set"> 设为</label>
+    <input type="text" name="source-value" class="field-value" disabled placeholder="填写新的来源">
+    <label><input type="radio" name="source-mode" value="clear"> 清空</label>
+  </div>
+  <div class="field-row">
+    <span class="field-label">地区</span>
+    <label><input type="radio" name="region-mode" value="keep" checked> 保持原值</label>
+    <label><input type="radio" name="region-mode" value="set"> 设为</label>
+    <input type="text" name="region-value" class="field-value" disabled placeholder="填写新的地区">
+    <label><input type="radio" name="region-mode" value="clear"> 清空</label>
+  </div>
+  <div class="field-row">
+    <span class="field-label">行业</span>
+    <label><input type="radio" name="industry-mode" value="keep" checked> 保持原值</label>
+    <label><input type="radio" name="industry-mode" value="set"> 设为</label>
+    <input type="text" name="industry-value" class="field-value" disabled placeholder="填写新的行业">
+    <label><input type="radio" name="industry-mode" value="clear"> 清空</label>
+  </div>
+  <div class="field-row">
+    <span class="field-label">重要日期</span>
+    <label><input type="radio" name="important_date-mode" value="keep" checked> 保持原值</label>
+    <label><input type="radio" name="important_date-mode" value="set"> 设为</label>
+    <input type="text" name="important_date-value" class="field-value" disabled placeholder="YYYY-MM-DD">
+    <label><input type="radio" name="important_date-mode" value="clear"> 清空</label>
+  </div>
+  <div style="margin-top:.75rem">
+    <button type="submit" id="batch-btn" disabled>批量修改</button>
+    <span id="batch-hint" class="hint" style="display:inline;margin-left:.6rem">请先勾选客户并选择要修改的字段。</span>
+  </div>
+</form>
+<div id="batch-report"></div>
+</section>
+
 <h2>客户列表</h2>
 <p id="clients-empty" class="muted">还没有客户记录。</p>
 <table id="clients-table">
-  <thead><tr><th>编号</th><th>客户名称</th><th>来源</th><th>地区</th><th>行业</th><th>重要日期</th></tr></thead>
+  <thead><tr>
+    <th class="check-col"><input type="checkbox" id="select-all" title="全选"></th>
+    <th>编号</th><th>客户名称</th><th>来源</th><th>地区</th><th>行业</th><th>重要日期</th>
+  </tr></thead>
   <tbody id="clients-body"></tbody>
 </table>
 
@@ -81,6 +132,7 @@ th{font-size:.85rem;color:#5b6b7b;font-weight:600}
 const ESC = {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"};
 const esc = s => String(s === null || s === undefined ? "" : s).replace(/[&<>"']/g, c => ESC[c]);
 const blank = v => (v === null || v === undefined || v === "") ? '<span class="muted">—</span>' : esc(v);
+const FIELD_NAMES = ["source", "region", "industry", "important_date"];
 
 async function loadClients() {
   const res = await fetch("/api/clients");
@@ -93,7 +145,8 @@ async function loadClients() {
     tbl.classList.add("on");
     empty.classList.remove("on");
     body.innerHTML = rows.map(r =>
-      "<tr><td>" + esc(r.id) + "</td><td>" + esc(r.name) + "</td><td>" + blank(r.source) +
+      "<tr><td class='check-col'><input type='checkbox' class='client-check' value='" + esc(r.id) + "' data-name='" + esc(r.name) + "'></td>" +
+      "<td>" + esc(r.id) + "</td><td>" + esc(r.name) + "</td><td>" + blank(r.source) +
       "</td><td>" + blank(r.region) + "</td><td>" + blank(r.industry) +
       "</td><td>" + blank(r.important_date) + "</td></tr>").join("");
   } else {
@@ -101,7 +154,128 @@ async function loadClients() {
     empty.classList.add("on");
     body.innerHTML = "";
   }
+  document.getElementById("select-all").checked = false;
+  updateSelectedInfo();
 }
+
+function getSelected() {
+  return Array.from(document.querySelectorAll(".client-check:checked")).map(c => ({
+    id: parseInt(c.value, 10),
+    name: c.dataset.name
+  }));
+}
+
+function updateSelectedInfo() {
+  const sel = getSelected();
+  const info = document.getElementById("selected-info");
+  if (sel.length === 0) {
+    info.textContent = "尚未勾选客户。";
+  } else {
+    const names = sel.map(s => s.name).join("、");
+    info.textContent = "已勾选 " + sel.length + " 位客户：" + names;
+  }
+  updateBatchButton();
+}
+
+function updateBatchButton() {
+  const sel = getSelected();
+  let changed = false;
+  for (const f of FIELD_NAMES) {
+    const mode = document.querySelector('input[name="' + f + '-mode"]:checked').value;
+    if (mode !== "keep") { changed = true; break; }
+  }
+  const btn = document.getElementById("batch-btn");
+  const hint = document.getElementById("batch-hint");
+  btn.disabled = sel.length === 0 || !changed;
+  if (sel.length === 0) {
+    hint.textContent = "请先勾选客户。";
+  } else if (!changed) {
+    hint.textContent = "请至少选择一个要修改的字段。";
+  } else {
+    hint.textContent = "将对勾选的 " + sel.length + " 位客户生效。";
+  }
+}
+
+document.getElementById("clients-body").addEventListener("change", e => {
+  if (e.target.classList.contains("client-check")) {
+    const all = document.querySelectorAll(".client-check");
+    const checked = document.querySelectorAll(".client-check:checked");
+    document.getElementById("select-all").checked = all.length > 0 && all.length === checked.length;
+    updateSelectedInfo();
+  }
+});
+
+document.getElementById("select-all").addEventListener("change", e => {
+  document.querySelectorAll(".client-check").forEach(c => { c.checked = e.target.checked; });
+  updateSelectedInfo();
+});
+
+for (const f of FIELD_NAMES) {
+  document.querySelectorAll('input[name="' + f + '-mode"]').forEach(r => {
+    r.addEventListener("change", () => {
+      const input = document.querySelector('input[name="' + f + '-value"]');
+      const mode = document.querySelector('input[name="' + f + '-mode"]:checked').value;
+      input.disabled = mode !== "set";
+      if (mode === "set") input.focus();
+      updateBatchButton();
+    });
+  });
+  document.querySelector('input[name="' + f + '-value"]').addEventListener("input", updateBatchButton);
+}
+
+function showBatchReport(innerHTML) {
+  const report = document.getElementById("batch-report");
+  report.innerHTML = innerHTML;
+}
+
+document.getElementById("batch-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const sel = getSelected();
+  if (sel.length === 0) {
+    showBatchReport('<div class="banner bad">请先勾选要修改的客户。</div>');
+    return;
+  }
+  const fields = {};
+  let changed = false;
+  for (const f of FIELD_NAMES) {
+    const mode = document.querySelector('input[name="' + f + '-mode"]:checked').value;
+    if (mode === "keep") continue;
+    changed = true;
+    if (mode === "clear") { fields[f] = {mode: "clear"}; continue; }
+    const value = document.querySelector('input[name="' + f + '-value"]').value;
+    fields[f] = {mode: "set", value: value};
+  }
+  if (!changed) {
+    showBatchReport('<div class="banner bad">请至少选择一个要修改的字段（设为或清空）。</div>');
+    return;
+  }
+  const btn = document.getElementById("batch-btn");
+  btn.disabled = true;
+  showBatchReport("");
+  try {
+    const res = await fetch("/api/clients/batch-edit", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({client_ids: sel.map(s => s.id), fields: fields})
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showBatchReport('<div class="banner ok">已成功修改 <b>' + esc(data.updated_count) + '</b> 位客户。</div>');
+      document.getElementById("batch-form").reset();
+      for (const f of FIELD_NAMES) {
+        document.querySelector('input[name="' + f + '-value"]').disabled = true;
+      }
+      await loadClients();
+    } else {
+      showBatchReport('<div class="banner bad">批量修改失败，勾选与输入已保留，请修正后重试。<br>原因：' +
+        esc(data.error || "未知错误") + '</div>');
+    }
+  } catch (err) {
+    showBatchReport('<div class="banner bad">批量修改请求失败：' + esc(err.message) + '</div>');
+  } finally {
+    updateSelectedInfo();
+  }
+});
 
 document.getElementById("file-input").addEventListener("change", e => {
   document.getElementById("filename").textContent = e.target.files[0] ? e.target.files[0].name : "";
@@ -164,6 +338,10 @@ loadClients();
 
 class FileError(Exception):
     """文件级错误：整份文件拒绝导入（HTTP 400）。"""
+
+
+class BatchEditError(Exception):
+    """批量修改错误：整次拒绝（HTTP 400），任何客户都不改变。"""
 
 
 def parse_csv(text):
@@ -339,6 +517,96 @@ def import_clients(database, text):
     }
 
 
+def batch_edit_clients(database, payload):
+    """批量修改客户的 source/region/industry/important_date 字段。
+
+    payload 形如：
+    {"client_ids": [1, 2], "fields": {"source": {"mode": "keep"}, ...}}
+    mode 为 keep/set/clear；set 时须提供 value（文本）。
+    整次校验通过后才写入，任何非法输入抛 BatchEditError（HTTP 400）。
+    """
+    if not isinstance(payload, dict):
+        raise BatchEditError("请求体必须是 JSON 对象")
+
+    raw_ids = payload.get("client_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise BatchEditError("未选择客户：client_ids 必须为非空数组")
+
+    client_ids = []
+    seen = set()
+    for cid in raw_ids:
+        if isinstance(cid, bool) or not isinstance(cid, int) or cid <= 0:
+            raise BatchEditError("客户编号必须为正整数：%r" % (cid,))
+        if cid not in seen:
+            seen.add(cid)
+            client_ids.append(cid)
+
+    fields = payload.get("fields")
+    if not isinstance(fields, dict):
+        raise BatchEditError("fields 必须为对象")
+
+    extra = [k for k in fields if k not in OPTIONAL_FIELDS]
+    if extra:
+        raise BatchEditError("包含四项以外的待修改字段：%s" % "、".join(extra))
+
+    actions = {}
+    for field_name in OPTIONAL_FIELDS:
+        cfg = fields.get(field_name)
+        if cfg is None:
+            actions[field_name] = ("keep", None)
+            continue
+        if not isinstance(cfg, dict):
+            raise BatchEditError("字段 %s 的配置必须为对象" % field_name)
+        mode = cfg.get("mode")
+        if mode == "keep":
+            actions[field_name] = ("keep", None)
+        elif mode == "clear":
+            actions[field_name] = ("clear", None)
+        elif mode == "set":
+            value = cfg.get("value")
+            if not isinstance(value, str):
+                raise BatchEditError("字段 %s 的设置值必须为文本" % field_name)
+            stripped = value.strip()
+            if not stripped:
+                # 仅含空白的填写值按清空处理
+                actions[field_name] = ("clear", None)
+            elif field_name == "important_date":
+                ok, reason = check_date(stripped)
+                if not ok:
+                    raise BatchEditError(reason)
+                actions[field_name] = ("set", stripped)
+            else:
+                actions[field_name] = ("set", stripped)
+        else:
+            raise BatchEditError("字段 %s 的 mode 必须为 keep、set 或 clear" % field_name)
+
+    if all(mode == "keep" for mode, _ in actions.values()):
+        raise BatchEditError("没有需要修改的字段：所有字段均保持原值")
+
+    placeholders = ",".join("?" * len(client_ids))
+    found = {row[0] for row in database.execute(
+        "SELECT id FROM clients WHERE id IN (%s)" % placeholders, client_ids)}
+    missing = [cid for cid in client_ids if cid not in found]
+    if missing:
+        raise BatchEditError("找不到客户编号：%s" % "、".join(str(c) for c in missing))
+
+    set_clauses = []
+    params = []
+    for field_name in OPTIONAL_FIELDS:
+        mode, value = actions[field_name]
+        if mode == "keep":
+            continue
+        set_clauses.append("%s = ?" % field_name)
+        params.append(value)
+
+    database.execute(
+        "UPDATE clients SET %s WHERE id IN (%s)" % (", ".join(set_clauses), placeholders),
+        params + client_ids)
+    database.commit()
+
+    return {"updated_count": len(client_ids)}
+
+
 def main():
     parser = argparse.ArgumentParser(description="ClientBook - 客户联系人与商机记录")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -391,9 +659,31 @@ def main():
                 return
             self.respond(200, result)
 
+        def handle_batch_edit(self):
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length > MAX_BODY:
+                self.respond(400, {"error": "请求体过大：超过 %d 字节上限" % MAX_BODY})
+                return
+            raw_body = self.rfile.read(length) if length > 0 else b""
+            try:
+                payload = json.loads(raw_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.respond(400, {"error": "请求体不是有效的 UTF-8 JSON"})
+                return
+            try:
+                result = batch_edit_clients(database, payload)
+            except BatchEditError as exc:
+                database.rollback()
+                self.respond(400, {"error": str(exc)})
+                return
+            self.respond(200, result)
+
         def route(self):
             location = urlsplit(self.path).path
-            if location not in ("/", "/health", "/api/clients", "/api/clients/import"):
+            if location not in ("/", "/health", "/api/clients", "/api/clients/import", "/api/clients/batch-edit"):
                 self.respond(404, {"error": "not found"})
                 return
             if location == "/api/clients/import":
@@ -401,6 +691,12 @@ def main():
                     self.respond(405, {"error": "method not allowed"}, allow="POST")
                     return
                 self.handle_import()
+                return
+            if location == "/api/clients/batch-edit":
+                if self.command != "POST":
+                    self.respond(405, {"error": "method not allowed"}, allow="POST")
+                    return
+                self.handle_batch_edit()
                 return
             if self.command != "GET":
                 self.respond(405, {"error": "method not allowed"}, allow="GET")
