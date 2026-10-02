@@ -49,6 +49,21 @@ table{border-collapse:collapse;width:100%}
 th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid #e3e8ee;vertical-align:top}
 th{font-size:.85rem;color:#5b6b7b;font-weight:600}
 .muted{color:#9aa7b4}
+#clients-body tr.selected{background:#f1f6fb}
+.sel-panel{background:#f5f8fb;border:1px solid #d8dee6;border-radius:6px;padding:.6rem .8rem;margin:.8rem 0}
+.sel-list{margin-top:.35rem}
+.sel-chip{display:inline-block;background:#fff;border:1px solid #cdd7e2;border-radius:999px;padding:.1rem .35rem .1rem .6rem;margin:.2rem .35rem .2rem 0;font-size:.9rem;white-space:nowrap}
+.sel-chip button{border:none;background:none;color:#5b6b7b;font-size:1.05rem;line-height:1;padding:0 .25rem;cursor:pointer}
+.sel-chip button:hover{color:#a02b2b}
+.bf{border:1px solid #d8dee6;border-radius:6px;padding:.55rem .8rem;margin:.6rem 0}
+.bf-head{display:flex;flex-wrap:wrap;gap:.8rem;align-items:center;margin-bottom:.35rem}
+.bf-head b{min-width:4.5rem}
+.bf-head label{font-weight:400;white-space:nowrap}
+.bf textarea{width:100%;box-sizing:border-box;font:inherit;resize:vertical;padding:.3rem .45rem}
+.bf input[type=text]{font:inherit;padding:.3rem .45rem}
+.bf textarea:disabled,.bf input:disabled{background:#f2f4f7;color:#8a97a5}
+.bf .val-hint{margin:.25rem 0 0;font-size:.85rem;color:#5b6b7b}
+#batch-report{margin-top:.75rem}
 .footer{color:#5b6b7b;font-size:.9rem;margin-top:2rem}
 </style>
 </head>
@@ -71,9 +86,25 @@ th{font-size:.85rem;color:#5b6b7b;font-weight:600}
 <h2>客户列表</h2>
 <p id="clients-empty" class="muted">还没有客户记录。</p>
 <table id="clients-table">
-  <thead><tr><th>编号</th><th>客户名称</th><th>来源</th><th>地区</th><th>行业</th><th>重要日期</th></tr></thead>
+  <thead><tr><th style="width:2.2rem"><input type="checkbox" id="check-all" title="全选/取消全选当前列表"></th><th>编号</th><th>客户名称</th><th>来源</th><th>地区</th><th>行业</th><th>重要日期</th></tr></thead>
   <tbody id="clients-body"></tbody>
 </table>
+
+<section class="card" id="batch-card">
+<h2>批量修改选中客户</h2>
+<div class="sel-panel">
+  已选择 <b id="sel-count">0</b> 名客户：
+  <div class="sel-list" id="sel-list"><span class="muted" id="sel-none">尚未勾选任何客户，勾选列表中的客户后可批量修改。</span></div>
+</div>
+<form id="batch-form">
+  <div id="batch-fields"></div>
+  <p class="hint">每个字段可分别选择「保持原值」「设为填写的值」或「清空」；初次进入编辑时全部保持原值，留空不会清空资料。来源、地区和行业保留内部空白与换行，仅含空白的填写值按清空处理；重要日期须为 YYYY-MM-DD 真实日历日期。客户名称和编号不参与编辑，也不会新建客户。</p>
+  <div style="margin-top:.6rem">
+    <button type="submit" id="batch-submit" disabled>保存修改</button>
+  </div>
+</form>
+<div id="batch-report"></div>
+</section>
 
 <p class="footer"><a href="/api/clients">查看客户列表接口</a> · <a href="/health">服务状态</a></p>
 </main>
@@ -82,18 +113,40 @@ const ESC = {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"};
 const esc = s => String(s === null || s === undefined ? "" : s).replace(/[&<>"']/g, c => ESC[c]);
 const blank = v => (v === null || v === undefined || v === "") ? '<span class="muted">—</span>' : esc(v);
 
+const BATCH_FIELDS = [
+  {key: "source", label: "来源"},
+  {key: "region", label: "地区"},
+  {key: "industry", label: "行业"},
+  {key: "important_date", label: "重要日期", date: true},
+];
+
+let clients = [];
+const selected = new Set();
+
 async function loadClients() {
   const res = await fetch("/api/clients");
   const data = await res.json();
-  const rows = data.clients || [];
+  clients = data.clients || [];
+  const known = new Set(clients.map(r => r.id));
+  for (const id of [...selected]) {
+    if (!known.has(id)) selected.delete(id);
+  }
+  renderClients();
+  renderSelection();
+}
+
+function renderClients() {
   const tbl = document.getElementById("clients-table");
   const empty = document.getElementById("clients-empty");
   const body = document.getElementById("clients-body");
-  if (rows.length) {
+  if (clients.length) {
     tbl.classList.add("on");
     empty.classList.remove("on");
-    body.innerHTML = rows.map(r =>
-      "<tr><td>" + esc(r.id) + "</td><td>" + esc(r.name) + "</td><td>" + blank(r.source) +
+    body.innerHTML = clients.map(r =>
+      '<tr data-id="' + esc(r.id) + '"' + (selected.has(r.id) ? ' class="selected"' : "") + ">" +
+      '<td><input type="checkbox" class="row-check" value="' + esc(r.id) + '"' +
+      (selected.has(r.id) ? " checked" : "") + " aria-label='选择客户 " + esc(r.id) + "'></td>" +
+      "<td>" + esc(r.id) + "</td><td>" + esc(r.name) + "</td><td>" + blank(r.source) +
       "</td><td>" + blank(r.region) + "</td><td>" + blank(r.industry) +
       "</td><td>" + blank(r.important_date) + "</td></tr>").join("");
   } else {
@@ -101,7 +154,148 @@ async function loadClients() {
     empty.classList.add("on");
     body.innerHTML = "";
   }
+  syncCheckAll();
 }
+
+function syncCheckAll() {
+  const box = document.getElementById("check-all");
+  box.checked = clients.length > 0 && selected.size === clients.length;
+  box.indeterminate = selected.size > 0 && selected.size < clients.length;
+}
+
+function renderSelection() {
+  document.getElementById("sel-count").textContent = String(selected.size);
+  const list = document.getElementById("sel-list");
+  if (!selected.size) {
+    list.innerHTML = '<span class="muted">尚未勾选任何客户，勾选列表中的客户后可批量修改。</span>';
+  } else {
+    const byId = new Map(clients.map(r => [r.id, r]));
+    list.innerHTML = [...selected].sort((a, b) => a - b).map(id => {
+      const r = byId.get(id);
+      return '<span class="sel-chip">#' + esc(id) + " " + esc(r ? r.name : "") +
+        ' <button type="button" data-remove="' + esc(id) + '" title="取消勾选该客户">×</button></span>';
+    }).join("");
+  }
+  document.getElementById("batch-submit").disabled = selected.size === 0;
+  document.querySelectorAll("#clients-body tr").forEach(tr => {
+    tr.classList.toggle("selected", selected.has(Number(tr.dataset.id)));
+  });
+  syncCheckAll();
+}
+
+function buildBatchFields() {
+  const wrap = document.getElementById("batch-fields");
+  wrap.innerHTML = BATCH_FIELDS.map(f =>
+    '<div class="bf" data-field="' + f.key + '">' +
+      '<div class="bf-head"><b>' + f.label + "</b>" +
+        '<label><input type="radio" name="' + f.key + '-op" value="keep" checked> 保持原值</label>' +
+        '<label><input type="radio" name="' + f.key + '-op" value="set"> 设为填写的值</label>' +
+        '<label><input type="radio" name="' + f.key + '-op" value="clear"> 清空</label>' +
+      "</div>" +
+      (f.date
+        ? '<input type="text" class="bf-value" disabled placeholder="YYYY-MM-DD" autocomplete="off">'
+        : '<textarea class="bf-value" rows="2" disabled></textarea>') +
+      '<p class="val-hint">' + (f.date
+        ? "非空时须为 YYYY-MM-DD 真实日历日期；仅含空白的填写值按清空处理。"
+        : "去除前后空白后保存，内部空白与换行保留；仅含空白的填写值按清空处理。") +
+      "</p></div>").join("");
+  wrap.querySelectorAll(".bf").forEach(card => {
+    const input = card.querySelector(".bf-value");
+    card.querySelectorAll('input[type=radio]').forEach(radio => radio.addEventListener("change", () => {
+      const op = card.querySelector('input[type=radio]:checked').value;
+      input.disabled = op !== "set";
+      if (op === "set") input.focus();
+    }));
+  });
+}
+
+function collectBatchPayload() {
+  const updates = {};
+  for (const card of document.querySelectorAll("#batch-fields .bf")) {
+    const key = card.dataset.field;
+    const op = card.querySelector('input[type=radio]:checked').value;
+    if (op === "keep") {
+      updates[key] = {op: "keep"};
+    } else if (op === "clear") {
+      updates[key] = {op: "clear"};
+    } else {
+      updates[key] = {op: "set", value: card.querySelector(".bf-value").value};
+    }
+  }
+  return {ids: [...selected].sort((a, b) => a - b), updates};
+}
+
+function resetBatchForm() {
+  document.querySelectorAll("#batch-fields .bf").forEach(card => {
+    card.querySelector('input[value=keep]').checked = true;
+    const input = card.querySelector(".bf-value");
+    input.value = "";
+    input.disabled = true;
+  });
+  document.getElementById("batch-report").innerHTML = "";
+}
+
+function showBatchReport(html) {
+  document.getElementById("batch-report").innerHTML = html;
+}
+
+document.getElementById("check-all").addEventListener("change", e => {
+  if (e.target.checked) clients.forEach(r => selected.add(r.id));
+  else selected.clear();
+  renderClients();
+  renderSelection();
+});
+
+document.getElementById("clients-body").addEventListener("change", e => {
+  if (!e.target.classList.contains("row-check")) return;
+  const id = Number(e.target.value);
+  if (e.target.checked) selected.add(id);
+  else selected.delete(id);
+  renderSelection();
+});
+
+document.getElementById("sel-list").addEventListener("click", e => {
+  const btn = e.target.closest("[data-remove]");
+  if (!btn) return;
+  selected.delete(Number(btn.dataset.remove));
+  renderClients();
+  renderSelection();
+});
+
+document.getElementById("batch-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  if (!selected.size) {
+    showBatchReport('<div class="banner bad">请先勾选至少一名客户。</div>');
+    return;
+  }
+  const btn = document.getElementById("batch-submit");
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/clients/batch-update", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(collectBatchPayload()),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showBatchReport('<div class="banner bad">本次修改已全部拒绝，客户资料保持原样。<br>原因：' +
+        esc(data.error || "未知错误") + "</div>");
+      return;
+    }
+    const count = data.updated_count;
+    resetBatchForm();
+    selected.clear();
+    await loadClients();
+    showBatchReport('<div class="banner ok">已成功处理 <b>' + esc(count) +
+      "</b> 名客户，相关列已刷新，勾选已清除。</div>");
+  } catch (err) {
+    showBatchReport('<div class="banner bad">批量修改请求失败：' + esc(err.message) + "</div>");
+  } finally {
+    btn.disabled = selected.size === 0;
+  }
+});
+
+buildBatchFields();
 
 document.getElementById("file-input").addEventListener("change", e => {
   document.getElementById("filename").textContent = e.target.files[0] ? e.target.files[0].name : "";
@@ -164,6 +358,110 @@ loadClients();
 
 class FileError(Exception):
     """文件级错误：整份文件拒绝导入（HTTP 400）。"""
+
+
+class BatchUpdateError(Exception):
+    """批量修改请求级错误：整次修改拒绝（HTTP 400）。"""
+
+
+FIELD_LABELS = {
+    "source": "来源",
+    "region": "地区",
+    "industry": "行业",
+    "important_date": "重要日期",
+}
+
+
+def _normalize_set_value(field_name, value):
+    """校验 set 操作的值并返回最终入库值；非法时抛 BatchUpdateError。
+
+    去除前后空白；仅含空白按清空（None）处理；来源/地区/行业保留内部空白与换行；
+    重要日期非空时须为 YYYY-MM-DD 真实日历日期。
+    """
+    if not isinstance(value, str):
+        raise BatchUpdateError("%s的设置值不是文本" % FIELD_LABELS[field_name])
+    text = value.strip()
+    if not text:
+        return None
+    if field_name == "important_date":
+        ok, reason = check_date(text)
+        if not ok:
+            raise BatchUpdateError(reason)
+    return text
+
+
+def batch_update_clients(database, payload):
+    """执行批量修改，返回 {"updated_count": 去重后的客户数}；非法请求抛 BatchUpdateError。
+
+    任一问题都整次拒绝，不写入任何客户。
+    """
+    if not isinstance(payload, dict):
+        raise BatchUpdateError("请求体必须是 JSON 对象")
+
+    raw_ids = payload.get("ids")
+    if not isinstance(raw_ids, list):
+        raise BatchUpdateError("ids 必须是客户编号数组")
+    if not raw_ids:
+        raise BatchUpdateError("未选择客户：请先勾选至少一名客户")
+
+    ids = []
+    seen_ids = set()
+    for raw_id in raw_ids:
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int) or raw_id <= 0:
+            raise BatchUpdateError("客户编号必须是正整数：%r 不合法" % (raw_id,))
+        if raw_id not in seen_ids:
+            seen_ids.add(raw_id)
+            ids.append(raw_id)
+
+    raw_updates = payload.get("updates", {})
+    if not isinstance(raw_updates, dict):
+        raise BatchUpdateError("updates 必须是字段修改说明对象")
+    extra = [key for key in raw_updates if key not in OPTIONAL_FIELDS]
+    if extra:
+        raise BatchUpdateError("包含不能修改或不存在的字段：%s" % "、".join(extra))
+
+    actions = {}
+    for field_name in OPTIONAL_FIELDS:
+        spec = raw_updates.get(field_name, {"op": "keep"})
+        if not isinstance(spec, dict):
+            raise BatchUpdateError("%s的修改说明必须是对象" % FIELD_LABELS[field_name])
+        op = spec.get("op")
+        if op not in ("keep", "set", "clear"):
+            raise BatchUpdateError(
+                "%s的操作必须是 keep、set 或 clear 之一" % FIELD_LABELS[field_name])
+        if op == "keep":
+            continue
+        if op == "clear":
+            actions[field_name] = None
+        else:
+            actions[field_name] = _normalize_set_value(field_name, spec.get("value"))
+
+    if not actions:
+        raise BatchUpdateError("全部字段均保持原值：请至少选择一个字段进行设置或清空")
+
+    placeholders = ",".join("?" for _ in ids)
+    existing = {
+        row[0]
+        for row in database.execute(
+            "SELECT id FROM clients WHERE id IN (%s)" % placeholders, ids
+        )
+    }
+    missing = [cid for cid in ids if cid not in existing]
+    if missing:
+        raise BatchUpdateError("找不到对应客户，编号：%s" % "、".join(str(c) for c in missing))
+
+    assignments = ", ".join("%s = ?" % field_name for field_name in actions)
+    params = list(actions.values()) + ids
+    try:
+        database.execute(
+            "UPDATE clients SET %s WHERE id IN (%s)" % (assignments, placeholders), params
+        )
+        database.commit()
+    except sqlite3.DatabaseError:
+        database.rollback()
+        raise BatchUpdateError("保存失败：数据库错误，本次修改未生效")
+
+    return {"updated_count": len(ids)}
 
 
 def parse_csv(text):
@@ -391,9 +689,34 @@ def main():
                 return
             self.respond(200, result)
 
+        def handle_batch_update(self):
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length > MAX_BODY:
+                self.respond(400, {"error": "请求体过大：超过 %d 字节上限" % MAX_BODY})
+                return
+            raw_body = self.rfile.read(length) if length > 0 else b""
+            try:
+                payload = json.loads(raw_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.respond(400, {"error": "请求体不是有效的 UTF-8 JSON 对象"})
+                return
+            try:
+                result = batch_update_clients(database, payload)
+            except BatchUpdateError as exc:
+                database.rollback()
+                self.respond(400, {"error": str(exc)})
+                return
+            self.respond(200, result)
+
         def route(self):
             location = urlsplit(self.path).path
-            if location not in ("/", "/health", "/api/clients", "/api/clients/import"):
+            if location not in (
+                "/", "/health", "/api/clients",
+                "/api/clients/import", "/api/clients/batch-update",
+            ):
                 self.respond(404, {"error": "not found"})
                 return
             if location == "/api/clients/import":
@@ -401,6 +724,12 @@ def main():
                     self.respond(405, {"error": "method not allowed"}, allow="POST")
                     return
                 self.handle_import()
+                return
+            if location == "/api/clients/batch-update":
+                if self.command != "POST":
+                    self.respond(405, {"error": "method not allowed"}, allow="POST")
+                    return
+                self.handle_batch_update()
                 return
             if self.command != "GET":
                 self.respond(405, {"error": "method not allowed"}, allow="GET")
