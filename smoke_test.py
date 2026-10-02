@@ -195,6 +195,46 @@ def main():
         after = req("GET", "/api/clients")[1]
         expect("拒绝后列表保持原样", after == before)
 
+        # 9b. 引号结构损坏：未加引号字段含引号 / 结束引号后多余字符 / 引号未闭合
+        # 均为整份拒绝（400），不保存任何记录；错误信息区分类型并指出表头或第 N 条数据记录
+        quote_cases = [
+            ("表头-未加引号字段含引号", '甲"乙,source\n', "未加引号", "表头"),
+            ("数据记录-未加引号字段含引号", 'name,source\n甲,展会\n乙"丙,官网\n', "未加引号", "第 2 条"),
+            ("表头-结束引号后多余字符", '"甲公司"x,source\n', "结束引号", "表头"),
+            ("数据记录-结束引号后多余字符", 'name,source\n"甲"x,展会\n', "结束引号", "第 1 条"),
+            ("结束引号后空格", 'name,source\n"甲" ,展会\n', "结束引号", "第 1 条"),
+            ("引号未闭合", 'name,source\n"甲,展会\n', "未闭合", "第 1 条"),
+            ("无行尾换行-引号未闭合", 'name,source\n"甲,展会', "未闭合", "第 1 条"),
+        ]
+        for label, content, kind, loc in quote_cases:
+            code, body = import_csv(content)
+            expect("引号结构损坏 400：" + label, code == 400 and "error" in body, body)
+            expect("错误类型具体：" + label, kind in body["error"], body["error"])
+            expect("错误位置具体：" + label, loc in body["error"], body["error"])
+        # 即使前面已有合法记录，结构损坏也整份拒绝，不保存任何记录
+        before = req("GET", "/api/clients")[1]
+        code, body = import_csv('name,source\n甲,展会\n乙"丙,官网\n')
+        expect("结构损坏整份拒绝 400", code == 400 and "error" in body, body)
+        after = req("GET", "/api/clients")[1]
+        expect("结构损坏不保存任何记录", after == before)
+        # 引号字段内的换行不增加数据记录编号
+        code, body = import_csv('name,source\n"甲\n乙",展会\n丙"丁,官网\n')
+        expect("引号内换行不增记录编号", code == 400 and "第 2 条" in body["error"], body)
+        # 合法用例仍正常：末尾空字段、引号空字段、无行尾换行、表头加引号
+        code, body = import_csv('name,source\n子,\n')
+        expect("末尾空字段不丢失", code == 200 and body["imported_count"] == 1, body)
+        code, body = import_csv('name,source\n丑,""\n')
+        expect("引号空字段按空值处理", code == 200 and body["imported_count"] == 1, body)
+        code, body = import_csv('name,source\n寅,展会')
+        expect("无行尾换行可导入", code == 200 and body["imported_count"] == 1, body)
+        code, body = import_csv('"name","source"\n卯,展会\n')
+        expect("表头加引号合法", code == 200 and body["imported_count"] == 1, body)
+        s, clients = req("GET", "/api/clients")
+        zi = [c for c in clients["clients"] if c["name"] == "子"][0]
+        chou = [c for c in clients["clients"] if c["name"] == "丑"][0]
+        expect("末尾空字段按空值", zi["source"] is None, zi)
+        expect("引号空字段按空值", chou["source"] is None, chou)
+
         # 10. 仅合法表头 → 0 新增 200
         s, d = import_csv("name,source,region,industry,important_date\n")
         expect("空数据零新增", s == 200 and d["imported_count"] == 0 and d["failed_count"] == 0, d)
@@ -241,7 +281,7 @@ def main():
                 time.sleep(0.1)
         _, d = req("GET", "/api/clients")
         names = [c["name"] for c in d["clients"]]
-        expect("重启后数据仍在", len(names) == 9, names)
+        expect("重启后数据仍在", len(names) == 13, names)
         expect("重启后新字段仍在", d["clients"][0]["region"] == "华东", d["clients"][0])
     finally:
         proc.terminate()

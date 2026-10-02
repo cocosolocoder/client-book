@@ -321,7 +321,7 @@ document.getElementById("import-form").addEventListener("submit", async e => {
     const res = await fetch("/api/clients/import", {method: "POST", body: file});
     const data = await res.json();
     renderReport(data, res.status);
-    if (res.ok && data.imported_count > 0) {
+    if (res.ok) {
       await loadClients();
     }
   } catch (err) {
@@ -333,7 +333,7 @@ document.getElementById("import-form").addEventListener("submit", async e => {
 
 function renderReport(data, status) {
   if (status === 400) {
-    showReport('<div class="banner bad">整份文件已拒绝导入，客户列表保持原样。<br>原因：' +
+    showReport('<div class="banner bad">整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。<br>原因：' +
       esc(data.error || "未知错误") + '</div>');
     return;
   }
@@ -468,15 +468,38 @@ def parse_csv(text):
     """解析 RFC 4180 风格 CSV，返回 (header, data_rows)。
 
     支持引号包裹的字段、引号内逗号与换行、双引号转义；
-    引号外支持 LF / CRLF / CR 换行。结构损坏时抛 FileError。
+    引号外支持 LF / CRLF / CR 换行。结构损坏时抛 FileError：
+    - 未加引号的字段中出现双引号（双引号只能在字段开头用于包住整个字段）；
+    - 结束引号后出现逗号、换行或文件结束以外的字符（含空格）；
+    - 文件结束时仍有字段处于引号内（引号未闭合）。
+    错误信息区分上述三种情况，并指出发生在表头还是第 N 条数据记录
+    （数据记录编号不包含表头，引号字段内的换行不增加编号）。
     """
     rows = []
     record = []
     field = []
-    quoted = False
-    started = False
+    quoted = False        # 当前字段处于引号内
+    started = False       # 当前字段已经开始（已有内容或已进入引号）
+    closed = False       # 引号字段刚结束，等待逗号 / 换行 / 文件结束
+    record_number = 0     # 0 = 表头，1 起为数据记录
     i = 0
     n = len(text)
+
+    def location():
+        return "表头" if record_number == 0 else "第 %d 条数据记录" % record_number
+
+    def structure_error(kind):
+        raise FileError("CSV 结构损坏（%s）：%s" % (location(), kind))
+
+    def finish_record():
+        nonlocal record, field, started, closed
+        record.append("".join(field))
+        rows.append(record)
+        record = []
+        field = []
+        started = False
+        closed = False
+
     while i < n:
         c = text[i]
         if quoted:
@@ -486,6 +509,7 @@ def parse_csv(text):
                     i += 2
                     continue
                 quoted = False
+                closed = True
                 i += 1
                 continue
             if c == "\r":
@@ -498,9 +522,27 @@ def parse_csv(text):
             field.append(c)
             i += 1
             continue
+        if closed:
+            # 引号已结束，只允许逗号、记录换行或文件结束
+            if c == ",":
+                record.append("".join(field))
+                field = []
+                started = False
+                closed = False
+            elif c in "\r\n":
+                if c == "\r" and i + 1 < n and text[i + 1] == "\n":
+                    i += 1
+                finish_record()
+                record_number += 1
+            else:
+                structure_error("结束引号后有多余字符，结束引号后只能紧接逗号、记录换行或文件结束")
+            i += 1
+            continue
         if c == '"' and not started:
             quoted = True
             started = True
+        elif c == '"':
+            structure_error("未加引号的字段中出现双引号，双引号只能在字段开头用于包住整个字段")
         elif c == ",":
             record.append("".join(field))
             field = []
@@ -512,18 +554,15 @@ def parse_csv(text):
                 # 空白行：不作为数据记录（显式的 "" 空字段 started=True，仍会保留）
                 i += 1
                 continue
-            record.append("".join(field))
-            rows.append(record)
-            record = []
-            field = []
-            started = False
+            finish_record()
+            record_number += 1
         else:
             field.append(c)
             started = True
         i += 1
     if quoted:
-        raise FileError("CSV 结构损坏：存在未闭合的引号")
-    if started or field or record:
+        structure_error("引号未闭合，文件结束时仍有字段处于引号内")
+    if started or field or record or closed:
         record.append("".join(field))
         rows.append(record)
     if not rows:
