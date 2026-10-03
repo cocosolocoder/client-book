@@ -283,6 +283,104 @@ def main():
         names = [c["name"] for c in d["clients"]]
         expect("重启后数据仍在", len(names) == 13, names)
         expect("重启后新字段仍在", d["clients"][0]["region"] == "华东", d["clients"][0])
+
+        # ===== 批量修改 =====
+        def batch_update(ids, updates):
+            body = json.dumps({"ids": ids, "updates": updates}).encode("utf-8")
+            r = urllib.request.Request(BASE + "/api/clients/batch-update", data=body,
+                                       method="POST",
+                                       headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(r) as resp:
+                    return resp.status, json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read().decode("utf-8"))
+
+        def client_by_id(cid):
+            return [c for c in req("GET", "/api/clients")[1]["clients"] if c["id"] == cid][0]
+
+        # 13. 准备三名资料互不相同的客户
+        s, d = import_csv(
+            "name,source,region,industry,important_date\n"
+            "批测甲,老客户推荐,华东,制造业,2020-01-15\n"
+            "批测乙,展会,华南,零售业,2021-06-30\n"
+            "批测丙,广告,华北,互联网,2022-12-01\n"
+        )
+        expect("批测客户导入 3 新增", s == 200 and d["imported_count"] == 3, d)
+        id_a, id_b, id_c = (x["id"] for x in d["imported"])
+        before_a = client_by_id(id_a)
+        before_b = client_by_id(id_b)
+        before_c = client_by_id(id_c)
+        expect("批测客户资料互不相同",
+               before_a["source"] != before_b["source"]
+               and before_a["region"] != before_b["region"]
+               and before_a["important_date"] != before_b["important_date"],
+               (before_a, before_b))
+
+        # 14. 只修改选中的两名：来源去前后空白（内部空白与换行保留）、行业清空、
+        #     地区与重要日期保持原值；未选中客户完全不变
+        new_source = "  新来源 含内部 空白\n第二行\t保留  "
+        s, d = batch_update([id_a, id_b], {
+            "source": {"op": "set", "value": new_source},
+            "industry": {"op": "clear"},
+            "region": {"op": "keep"},
+            "important_date": {"op": "keep"},
+        })
+        expect("批量修改 200 且处理 2 名", s == 200 and d == {"updated_count": 2}, (s, d))
+        after_a = client_by_id(id_a)
+        after_b = client_by_id(id_b)
+        expect("来源去除前后空白", after_a["source"] == "新来源 含内部 空白\n第二行\t保留"
+               and after_b["source"] == after_a["source"], (after_a, after_b))
+        expect("来源内部空白与换行保留", "\n第二行" in after_a["source"]
+               and "含内部 空白" in after_a["source"], after_a["source"])
+        expect("行业清空为 null", after_a["industry"] is None and after_b["industry"] is None,
+               (after_a, after_b))
+        expect("地区各自保持原值", after_a["region"] == "华东" and after_b["region"] == "华南",
+               (after_a, after_b))
+        expect("日期各自保持原值", after_a["important_date"] == "2020-01-15"
+               and after_b["important_date"] == "2021-06-30", (after_a, after_b))
+        expect("编号与名称不变", after_a["id"] == id_a and after_a["name"] == "批测甲"
+               and after_b["id"] == id_b and after_b["name"] == "批测乙", (after_a, after_b))
+        expect("未选中客户完全不变", client_by_id(id_c) == before_c, client_by_id(id_c))
+
+        # 15. 重复编号只算一名；原值已等于设置值的客户仍计入；
+        #     保持原值的字段省略修改说明后非空值不丢失
+        s, d = batch_update([id_a, id_a, id_b, id_a],
+                            {"source": {"op": "set", "value": "新来源 含内部 空白\n第二行\t保留"}})
+        expect("重复编号去重计数", s == 200 and d == {"updated_count": 2}, (s, d))
+        after_a = client_by_id(id_a)
+        expect("省略修改说明的字段不丢值", after_a["region"] == "华东"
+               and after_a["important_date"] == "2020-01-15", after_a)
+        expect("省略后行业仍为 null", after_a["industry"] is None, after_a)
+        expect("重复提交未选中客户仍不变", client_by_id(id_c) == before_c, client_by_id(id_c))
+
+        # 16. 闰年日期合法，列表按 YYYY-MM-DD 返回
+        s, d = batch_update([id_a], {"important_date": {"op": "set", "value": "2024-02-29"}})
+        expect("闰年日期接受", s == 200 and d == {"updated_count": 1}, (s, d))
+        expect("日期按 YYYY-MM-DD 返回", client_by_id(id_a)["important_date"] == "2024-02-29",
+               client_by_id(id_a))
+
+        # 17. 拒绝：日期无效（2023-02-29）→ 400，整次不生效
+        snapshot = req("GET", "/api/clients")[1]
+        s, d = batch_update([id_a, id_b], {
+            "source": {"op": "set", "value": "不应保存的来源"},
+            "industry": {"op": "clear"},
+            "important_date": {"op": "set", "value": "2023-02-29"},
+        })
+        expect("无效日期 400", s == 400 and "error" in d and "updated_count" not in d, (s, d))
+        expect("无效日期原因具体", "2023-02-29" in d["error"] and "日历" in d["error"], d)
+        expect("无效日期整次不生效", req("GET", "/api/clients")[1] == snapshot)
+
+        # 18. 拒绝：选中编号混有不存在的客户 → 400，整次不生效
+        ghost = max(c["id"] for c in snapshot["clients"]) + 1000
+        s, d = batch_update([id_a, id_b, ghost], {
+            "source": {"op": "set", "value": "不应保存的来源"},
+            "industry": {"op": "clear"},
+        })
+        expect("不存在编号 400", s == 400 and "error" in d and "updated_count" not in d, (s, d))
+        expect("不存在编号原因具体", str(ghost) in d["error"], d)
+        expect("不存在编号整次不生效", req("GET", "/api/clients")[1] == snapshot)
+        expect("拒绝后未选中客户仍不变", client_by_id(id_c) == before_c, client_by_id(id_c))
     finally:
         proc.terminate()
         proc.wait(timeout=5)
