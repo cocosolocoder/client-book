@@ -38,6 +38,7 @@ button:disabled{background:#9db6cc;border-color:#9db6cc;cursor:default}
 .banner{padding:.6rem 1rem;border-radius:6px;margin-bottom:.75rem}
 .banner.ok{background:#e9f7ec;border:1px solid #bfe3c8}
 .banner.bad{background:#fdeeee;border:1px solid #f3c4c4}
+.banner.busy{background:#eef4fb;border:1px solid #c3d5e8}
 .failures{border:1px solid #ecd7d7;background:#fdf6f6;border-radius:6px;padding:.5rem 1rem;max-height:16rem;overflow:auto}
 .failures b{color:#a02b2b}
 .failures ul{margin:.4rem 0}
@@ -122,6 +123,15 @@ const BATCH_FIELDS = [
 
 let clients = [];
 const selected = new Set();
+// 一次批量保存从发出到本次结果处理结束期间为 true：期间只能有这一次请求，
+// 勾选变化与表单重复提交都不能解除或新增请求。
+let batchSaving = false;
+
+function syncSubmitState() {
+  const btn = document.getElementById("batch-submit");
+  btn.disabled = batchSaving || selected.size === 0;
+  btn.textContent = batchSaving ? "正在保存…" : "保存修改";
+}
 
 async function loadClients() {
   const res = await fetch("/api/clients");
@@ -176,7 +186,7 @@ function renderSelection() {
         ' <button type="button" data-remove="' + esc(id) + '" title="取消勾选该客户">×</button></span>';
     }).join("");
   }
-  document.getElementById("batch-submit").disabled = selected.size === 0;
+  syncSubmitState();
   document.querySelectorAll("#clients-body tr").forEach(tr => {
     tr.classList.toggle("selected", selected.has(Number(tr.dataset.id)));
   });
@@ -232,7 +242,6 @@ function resetBatchForm() {
     input.value = "";
     input.disabled = true;
   });
-  document.getElementById("batch-report").innerHTML = "";
 }
 
 function showBatchReport(html) {
@@ -264,20 +273,29 @@ document.getElementById("sel-list").addEventListener("click", e => {
 
 document.getElementById("batch-form").addEventListener("submit", async e => {
   e.preventDefault();
+  // 等待结果期间再次提交（重复点击、回车等）一律忽略：不增加请求、不提前显示成功、
+  // 不清除已填内容；等待期间的勾选变化也不会在结果返回后自动补交。
+  if (batchSaving) return;
   if (!selected.size) {
     showBatchReport('<div class="banner bad">请先勾选至少一名客户。</div>');
+    syncSubmitState();
     return;
   }
-  const btn = document.getElementById("batch-submit");
-  btn.disabled = true;
+  // 以本次点击时的勾选与填写为准，固化请求内容；等待期间勾选变化不影响本次请求。
+  const payload = collectBatchPayload();
+  batchSaving = true;
+  syncSubmitState();
+  showBatchReport('<div class="banner busy">正在保存本次批量修改，请勿重复提交…</div>');
   try {
     const res = await fetch("/api/clients/batch-update", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(collectBatchPayload()),
+      body: JSON.stringify(payload),
     });
     const data = await res.json();
     if (!res.ok) {
+      // 服务明确拒绝：显示具体原因，保留当时页面上的勾选、字段操作及填写内容，
+      // 由用户修正后主动再次保存。
       showBatchReport('<div class="banner bad">本次修改已全部拒绝，客户资料保持原样。<br>原因：' +
         esc(data.error || "未知错误") + "</div>");
       return;
@@ -289,9 +307,12 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
     showBatchReport('<div class="banner ok">已成功处理 <b>' + esc(count) +
       "</b> 名客户，相关列已刷新，勾选已清除。</div>");
   } catch (err) {
+    // 请求失败也要结束等待并显示失败，不能使页面一直无法继续使用。
     showBatchReport('<div class="banner bad">批量修改请求失败：' + esc(err.message) + "</div>");
   } finally {
-    btn.disabled = selected.size === 0;
+    // 等待结束：是否能保存仍取决于有没有选中客户（成功后已清除勾选）。
+    batchSaving = false;
+    syncSubmitState();
   }
 });
 
