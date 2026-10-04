@@ -39,6 +39,7 @@ button:disabled{background:#9db6cc;border-color:#9db6cc;cursor:default}
 .banner.ok{background:#e9f7ec;border:1px solid #bfe3c8}
 .banner.bad{background:#fdeeee;border:1px solid #f3c4c4}
 .banner.busy{background:#eef4fb;border:1px solid #c3d5e8}
+.banner.warn{background:#fdf6e5;border:1px solid #ecd9a8}
 .failures{border:1px solid #ecd7d7;background:#fdf6f6;border-radius:6px;padding:.5rem 1rem;max-height:16rem;overflow:auto}
 .failures b{color:#a02b2b}
 .failures ul{margin:.4rem 0}
@@ -133,10 +134,17 @@ function syncSubmitState() {
   btn.textContent = batchSaving ? "正在保存…" : "保存修改";
 }
 
+// 读取客户列表。任何失败（连接错误、非成功状态、响应无法解析或
+// 未包含有效客户列表）都抛异常，且绝不改动当前已显示的客户数据：
+// 错误响应即使是可解析的 JSON，也不能当作空客户列表处理。
 async function loadClients() {
   const res = await fetch("/api/clients");
+  if (!res.ok) throw new Error("服务返回状态 " + res.status);
   const data = await res.json();
-  clients = data.clients || [];
+  if (!data || !Array.isArray(data.clients)) {
+    throw new Error("响应中未包含有效的客户列表");
+  }
+  clients = data.clients;
   const known = new Set(clients.map(r => r.id));
   for (const id of [...selected]) {
     if (!known.has(id)) selected.delete(id);
@@ -286,33 +294,57 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
   batchSaving = true;
   syncSubmitState();
   showBatchReport('<div class="banner busy">正在保存本次批量修改，请勿重复提交…</div>');
+  // 第一阶段：等待保存接口的明确答复。只有收到成功状态及处理数量，
+  // 才允许进入成功流程；其余一律按失败或拒绝展示，绝不提前宣称已保存。
+  let count = null;
   try {
     const res = await fetch("/api/clients/batch-update", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(payload),
     });
-    const data = await res.json();
+    let data = null;
+    try { data = await res.json(); } catch (parseErr) { data = null; }
     if (!res.ok) {
       // 服务明确拒绝：显示具体原因，保留当时页面上的勾选、字段操作及填写内容，
       // 由用户修正后主动再次保存。
       showBatchReport('<div class="banner bad">本次修改已全部拒绝，客户资料保持原样。<br>原因：' +
-        esc(data.error || "未知错误") + "</div>");
+        esc((data && data.error) || "未知错误") + "</div>");
       return;
     }
-    const count = data.updated_count;
-    resetBatchForm();
-    selected.clear();
-    await loadClients();
-    showBatchReport('<div class="banner ok">已成功处理 <b>' + esc(count) +
-      "</b> 名客户，相关列已刷新，勾选已清除。</div>");
+    if (!data || typeof data.updated_count !== "number") {
+      // 成功状态但回复无法识别：没有明确的保存成功答复，不能按已保存处理。
+      showBatchReport('<div class="banner bad">批量修改请求失败：服务回复无法识别，' +
+        "本次修改结果未知，请刷新客户列表核对后再决定是否需要重新保存。</div>");
+      return;
+    }
+    count = data.updated_count;
   } catch (err) {
     // 请求失败也要结束等待并显示失败，不能使页面一直无法继续使用。
     showBatchReport('<div class="banner bad">批量修改请求失败：' + esc(err.message) + "</div>");
+    return;
   } finally {
     // 等待结束：是否能保存仍取决于有没有选中客户（成功后已清除勾选）。
     batchSaving = false;
     syncSubmitState();
+  }
+  // 第二阶段：保存已明确成功（数量以保存回复为准，不按旧表格、勾选或刷新结果推算）。
+  // 清除本次勾选、字段编辑恢复为保持原值，旧表格上的勾选状态同步清除。
+  resetBatchForm();
+  selected.clear();
+  renderClients();
+  renderSelection();
+  // 随后尝试刷新列表。刷新失败不影响已保存的结果：保留成功提示，
+  // 另行告知列表暂未更新；已显示的客户资料保持原样，不清空表格。
+  try {
+    await loadClients();
+    showBatchReport('<div class="banner ok">已成功处理 <b>' + esc(count) +
+      "</b> 名客户，列表已刷新为最新资料，勾选已清除。</div>");
+  } catch (err) {
+    showBatchReport('<div class="banner ok">已成功处理 <b>' + esc(count) +
+      "</b> 名客户，勾选已清除。</div>" +
+      '<div class="banner warn">客户列表暂未更新（' + esc(err.message) +
+      "）：当前显示的资料可能仍是保存前的内容，这不影响已保存的修改，请稍后刷新查看，无需再次保存。</div>");
   }
 });
 
@@ -343,7 +375,8 @@ document.getElementById("import-form").addEventListener("submit", async e => {
     const data = await res.json();
     renderReport(data, res.status);
     if (res.ok) {
-      await loadClients();
+      // 导入已成功；列表刷新失败不影响导入结果，也不把导入报告改成失败。
+      try { await loadClients(); } catch (refreshErr) { /* 保留当前列表，稍后可手动刷新 */ }
     }
   } catch (err) {
     showReport('<div class="banner bad">导入请求失败：' + esc(err.message) + '</div>');
@@ -370,7 +403,8 @@ function renderReport(data, status) {
   showReport(out);
 }
 
-loadClients();
+// 首次加载失败时保留空列表提示区域原状，稍后刷新页面重试即可。
+loadClients().catch(() => {});
 </script>
 </body>
 </html>
