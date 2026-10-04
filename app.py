@@ -277,6 +277,18 @@ function showBatchReport(html) {
   document.getElementById("batch-report").innerHTML = html;
 }
 
+// 未取得可靠保存结论时的统一口径（连接中断、回复无法读取/解析、非 400 的非成功
+// 状态、成功状态下缺少有效处理数量）：不显示成功数量，也不断言客户资料一定未变
+// 或已经回滚；提示先核对客户列表再决定是否重新提交。不执行保存成功后的清理——
+// 结果处理时页面上的勾选、各字段操作与已填内容一律保留，旧表格继续显示，
+// 也不自动再次发送修改。prefix 用于带上已知的 HTTP 状态与可读错误说明。
+function batchUnconfirmedHtml(prefix) {
+  return '<div class="banner bad">' + prefix +
+    "本次修改是否生效无法确认，客户资料可能已经被修改，也可能保持原样；" +
+    "请先核对客户列表，再决定是否重新提交。当前勾选、各字段的操作与已填内容均已保留，" +
+    "不会自动再次发送修改。</div>";
+}
+
 document.getElementById("check-all").addEventListener("change", e => {
   if (e.target.checked) clients.forEach(r => selected.add(r.id));
   else selected.clear();
@@ -316,35 +328,74 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
   syncSubmitState();
   showBatchReport('<div class="banner busy">正在保存本次批量修改，请勿重复提交…</div>');
   try {
-    const res = await fetch("/api/clients/batch-update", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
-    });
-    // 响应无法读取或无法解析时，尚未收到服务明确的保存结论：不能当作保存成功，
-    // 也不使用“已保存、仅刷新失败”的说法，保留勾选与填写供用户确认后重新提交。
-    let data;
+    let res;
     try {
-      data = await res.json();
-    } catch (parseErr) {
-      showBatchReport('<div class="banner bad">批量修改请求失败：保存结果无法读取' +
-        "（HTTP " + res.status + "），本次修改是否生效无法确认，请稍后核对列表后再决定是否重新提交。</div>");
+      res = await fetch("/api/clients/batch-update", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+    } catch (netErr) {
+      // 连接中断、未拿到任何回复：不知道服务是否已经处理并写入，不能声称资料
+      // 未变或已回滚；保留结果处理时页面上的勾选、字段操作与填写，不自动重发。
+      showBatchReport(batchUnconfirmedHtml(
+        "批量修改请求未能完成（" + esc(netErr.message) + "）：未收到保存回复，"));
+      return;
+    }
+    // 先取原文再尝试解析：错误回复可能是 {error: "..."}，也可能只有一段纯文本。
+    const raw = await res.text().catch(() => null);
+    let data = null;
+    if (raw !== null && raw.trim()) {
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        data = null;
+      }
+    }
+    if (res.status === 400) {
+      // 只有 HTTP 400 且带有明确、可读的拒绝原因时，才按整次修改被拒绝处理：
+      // 本次没有任何客户被改动，展示具体原因供用户修正。
+      // 勾选、字段操作与填写保留在页面上，由用户修正后主动再次保存。
+      const reason = readableError(data, raw);
+      if (reason) {
+        showBatchReport('<div class="banner bad">本次修改已全部拒绝，客户资料保持原样。<br>原因：' +
+          esc(reason) + "</div>");
+        return;
+      }
+      // 400 但回复为空或无法解析：没有明确可读的拒绝原因，不能当成明确拒绝。
+      showBatchReport(batchUnconfirmedHtml(
+        "服务返回 HTTP 400，但未给出可读取的拒绝原因（回复为空或无法解析），"));
       return;
     }
     if (!res.ok) {
-      // 服务明确拒绝：显示具体原因，保留当时页面上的勾选、字段操作及填写内容，
-      // 由用户修正后主动再次保存。
-      showBatchReport('<div class="banner bad">本次修改已全部拒绝，客户资料保持原样。<br>原因：' +
-        esc(data.error || "未知错误") + "</div>");
+      // 其他非成功状态（如 HTTP 500/502）：即使带有可解析的错误说明，客户资料
+      // 也可能已经被修改，不能断言“保持原样”；提示中保留已知状态与可读说明。
+      const detail = readableError(data, raw);
+      const lead = detail
+        ? "批量修改未成功（HTTP " + res.status + "）：" + esc(detail) + "。"
+        : "批量修改未成功（HTTP " + res.status + "），服务未给出可展示的错误说明。";
+      showBatchReport(batchUnconfirmedHtml(lead));
+      return;
+    }
+    // 成功状态但回复无法读取或无法解析：仍没有可靠结论，不能显示成功数量、
+    // 不能执行保存成功后的清理。
+    if (raw === null) {
+      showBatchReport(batchUnconfirmedHtml(
+        "保存请求已返回成功状态，但保存回复无法读取（HTTP " + res.status + "），"));
+      return;
+    }
+    if (data === null) {
+      showBatchReport(batchUnconfirmedHtml(
+        "保存请求已返回成功状态，但回复内容无法解析，"));
       return;
     }
     // 服务明确返回成功：成功处理数量以保存回复为准，不按旧表格、当前勾选或刷新结果重算。
     // 立即清除本次勾选并把字段编辑恢复为保持原值，随后的列表刷新成败都不改变这一结果。
     const count = data.updated_count;
     if (typeof count !== "number" || !Number.isFinite(count)) {
-      // 没有明确的成功与处理数量，不能当作保存成功。
-      showBatchReport('<div class="banner bad">批量修改请求失败：服务未返回有效的处理数量，' +
-        "本次修改是否生效无法确认，请稍后核对列表后再决定是否重新提交。</div>");
+      // 没有明确的成功与处理数量，不能当作保存成功，也不能按零或表格行数补算。
+      showBatchReport(batchUnconfirmedHtml(
+        "保存请求已返回成功状态，但回复未包含有效的处理数量，"));
       return;
     }
     resetBatchForm();
@@ -356,8 +407,8 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
       await loadClients();
     } catch (loadErr) {
       refreshed = false;
-      // 刷新失败不自动重交刚才的修改，也不要求用户再次保存；旧表格（含勾选状态）
-      // 已按保存成功的结果保留/清除，不被读取失败清空。
+      // 这里是保存已确认成功之后的列表读取失败：保存结论不受影响，不自动重交修改，
+      // 也不要求用户再次保存；旧表格不被读取失败清空。
       showBatchReport(
         '<div class="banner ok">已成功处理 <b>' + esc(count) +
         "</b> 名客户，勾选已清除，字段编辑已恢复为保持原值。</div>" +
@@ -370,10 +421,12 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
         "</b> 名客户，列表已更新，勾选已清除，字段编辑已恢复为保持原值。</div>");
     }
   } catch (err) {
-    // 请求失败也要结束等待并显示失败，不能使页面一直无法继续使用。
-    showBatchReport('<div class="banner bad">批量修改请求失败：' + esc(err.message) + "</div>");
+    // 结果处理过程中出现意外问题，同样没有可靠结论：按无法确认提示，
+    // 不显示成功数量、不断言资料未变或已回滚，保留页面上的勾选与填写。
+    showBatchReport(batchUnconfirmedHtml(
+      "批量修改结果处理出现意外问题（" + esc(err.message) + "）："));
   } finally {
-    // 等待结束：是否能保存仍取决于有没有选中客户（成功后已清除勾选）。
+    // 等待结束：按钮恢复“保存修改”，是否可提交仍取决于当前有没有勾选客户。
     batchSaving = false;
     syncSubmitState();
   }
