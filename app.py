@@ -391,6 +391,30 @@ function showReport(innerHTML, ok) {
   report.innerHTML = innerHTML;
 }
 
+// 校验成功状态下的导入报告：新增与未导入数量须为非负整数，未导入明细逐条
+// 含正整数数据记录编号与非空文本原因，且明细条数与未导入数量一致。
+// 任一条件不满足都返回 null，调用方不得用零、空明细或 undefined 补成成功报告。
+function validateImportReport(data) {
+  if (!data || typeof data !== "object") return null;
+  const countOk = v => typeof v === "number" && Number.isInteger(v) && v >= 0;
+  if (!countOk(data.imported_count) || !countOk(data.failed_count)) return null;
+  if (!Array.isArray(data.failures) || data.failures.length !== data.failed_count) return null;
+  for (const f of data.failures) {
+    if (!f || typeof f !== "object") return null;
+    if (typeof f.row !== "number" || !Number.isInteger(f.row) || f.row <= 0) return null;
+    if (typeof f.reason !== "string" || !f.reason.trim()) return null;
+  }
+  return data;
+}
+
+function showUncertainImport(detail) {
+  // 没有取得可靠的导入结果：不显示成功数量，也不声称资料一定未变化；
+  // 不清空已有客户、勾选与批量修改填写，已选文件保留，由用户核对后主动处理。
+  showReport('<div class="banner bad">' + detail +
+    "<br>本次导入是否生效无法确认，没有取得可靠的导入结果；" +
+    "请先核对客户列表再决定是否重新导入，页面不会自动补交文件。</div>");
+}
+
 document.getElementById("import-form").addEventListener("submit", async e => {
   e.preventDefault();
   const input = document.getElementById("file-input");
@@ -403,38 +427,61 @@ document.getElementById("import-form").addEventListener("submit", async e => {
   btn.disabled = true;
   try {
     const res = await fetch("/api/clients/import", {method: "POST", body: file});
-    const data = await res.json();
-    renderReport(data, res.status);
-    if (res.ok) {
-      // 导入结果已明确后，列表读取失败只补充提示，不把已成功的导入改写成请求失败。
-      try {
-        await loadClients();
-      } catch (loadErr) {
-        showReport(
-          (document.getElementById("report").innerHTML) +
-          '<div class="banner warn">导入后读取客户列表失败（' + esc(loadErr.message) +
-          "）：列表暂未更新，当前显示的资料可能不是最新内容；导入结果以上述报告为准，稍后刷新页面即可。</div>");
-      }
+    // 回复体统一先尝试解析，解析失败不直接当作请求异常，仍按状态码区分处理。
+    let data = null, parsed = true;
+    try {
+      data = await res.json();
+    } catch (parseErr) {
+      parsed = false;
+    }
+    if (res.status === 400) {
+      // 服务按约定明确整份拒绝：显示具体原因，本次没有新增客户。
+      showReport('<div class="banner bad">整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。<br>原因：' +
+        esc(parsed && data && data.error ? data.error : "服务未返回可读取的错误说明") + '</div>');
+      return;
+    }
+    if (!res.ok) {
+      // 其他非成功状态：即使回复可解析，也不显示成功数量、不声称资料一定未变化。
+      showUncertainImport("导入请求返回非成功状态（HTTP " + esc(res.status) + "）。" +
+        (parsed && data && data.error
+          ? "服务说明：" + esc(data.error)
+          : "服务未返回可读取的错误说明。"));
+      return;
+    }
+    // 只有服务明确返回成功状态且报告完整合法时，才显示新增/未导入数量与逐条原因。
+    const report = parsed ? validateImportReport(data) : null;
+    if (!report) {
+      showUncertainImport("服务返回了成功状态，但导入报告" +
+        (parsed ? "内容不完整或格式不符" : "无法解析") + "，本次结果无法确认。");
+      return;
+    }
+    renderReport(report);
+    // 导入结果已明确后，列表读取失败只补充提示，不把已成功的导入改写成请求失败。
+    try {
+      await loadClients();
+    } catch (loadErr) {
+      showReport(
+        (document.getElementById("report").innerHTML) +
+        '<div class="banner warn">导入后读取客户列表失败（' + esc(loadErr.message) +
+        "）：列表暂未更新，当前显示的资料可能不是最新内容；导入结果以上述报告为准，稍后刷新页面即可。</div>");
     }
   } catch (err) {
-    showReport('<div class="banner bad">导入请求失败：' + esc(err.message) + '</div>');
+    // 请求未能送达或响应无法读取：同样属于没有取得可靠的导入结果。
+    showUncertainImport("导入请求失败：" + esc(err.message) + "。");
   } finally {
+    // 结束等待；已选文件保留在文件框中，供用户核对后主动重新提交。
     btn.disabled = false;
   }
 });
 
-function renderReport(data, status) {
-  if (status === 400) {
-    showReport('<div class="banner bad">整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。<br>原因：' +
-      esc(data.error || "未知错误") + '</div>');
-    return;
-  }
-  const failures = data.failures || [];
-  let out = '<div class="banner ok">新增 <b>' + esc(data.imported_count) + '</b> 条，' +
-    '未导入 <b>' + failures.length + '</b> 条。</div>';
-  if (failures.length) {
+// 仅在报告已通过 validateImportReport 校验后调用：数量与明细均可直接展示，
+// 合法的零新增（仅有表头或全部记录被跳过）同样按此正常显示。
+function renderReport(report) {
+  let out = '<div class="banner ok">新增 <b>' + esc(report.imported_count) + '</b> 条，' +
+    '未导入 <b>' + esc(report.failed_count) + '</b> 条。</div>';
+  if (report.failures.length) {
     out += '<div class="failures"><p><b>未导入记录（编号按原文件数据记录，表头不计入）：</b></p><ul>';
-    out += failures.map(f =>
+    out += report.failures.map(f =>
       "<li>第 <b>" + esc(f.row) + "</b> 条：" + esc(f.reason) + "</li>").join("");
     out += "</ul></div>";
   }
