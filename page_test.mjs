@@ -130,6 +130,8 @@ async function openSession(browser, base) {
     batchOverride: null,
     // batchHold 为 true 时挂起保存请求（既不应答也不转发），模拟服务尚未给出结果
     batchHold: false,
+    // batchAbort 为 true 时直接断开保存请求连接（收不到任何响应）
+    batchAbort: false,
   };
   const counts = {batchPosts: 0, listGets: 0};
   // 被挂起的保存请求：{request, payload}，放行时 continue 发往真实后端
@@ -165,9 +167,14 @@ async function openSession(browser, base) {
         held.push({request, payload: request.postData()});
         return;
       }
+      if (modes.batchAbort) {
+        request.abort("failed");
+        return;
+      }
       if (modes.batchOverride) {
-        const {status, body} = modes.batchOverride;
-        request.respond({status, contentType: "application/json; charset=utf-8", body});
+        const {status, body, ct} = modes.batchOverride;
+        request.respond({status,
+          contentType: ct || "application/json; charset=utf-8", body});
         return;
       }
     }
@@ -311,6 +318,31 @@ function cleanedUp(snap) {
     snap.rows.every(r => !r.checked && !r.selected) &&
     snap.fields.every(f => f.op === "keep" && f.value === "" && f.disabled) &&
     snap.submitText === "保存修改" && snap.submitDisabled;
+}
+
+// 「结果无法确认」横幅：bad 类；明确无法确认、提醒先核对客户列表再决定是否重新保存；
+// 不出现成功数量；不做「全部拒绝/资料保持原样」的肯定结论；不自动重发。
+// （文案可以、也应当明确否定「未修改/已回滚」，故不把这些词本身列为违禁。）
+function unconfirmedBanner(snap) {
+  return snap.banners.length === 1 && snap.banners[0].cls.includes("bad") &&
+    snap.banners[0].text.includes("无法确认") &&
+    snap.banners[0].text.includes("核对客户列表") &&
+    /重新保存/.test(snap.banners[0].text) &&
+    snap.banners[0].text.includes("不会自动重新提交") &&
+    !/已成功处理/.test(snap.reportText) &&
+    !/全部拒绝/.test(snap.reportText) &&
+    !/保持原样/.test(snap.reportText);
+}
+
+// 无法确认时不做保存成功后的清理：勾选、字段操作与已填内容原样保留
+function retainedState(snap, {count, ops}) {
+  return snap.selCount === String(count) &&
+    snap.rows.filter(r => r.checked).length === count &&
+    ops.every(([key, op, value]) => {
+      const f = snap.fields.find(x => x.key === key);
+      return f && f.op === op && (value === undefined || f.value === value);
+    }) &&
+    snap.submitText === "保存修改" && !snap.submitDisabled;
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +678,291 @@ async function run() {
           snap.banners);
         check("G 回复 5 名：勾选与编辑同样完成清理、按钮恢复禁用",
           cleanedUp(snap), {sel: snap.selCount, fields: snap.fields});
+        await page.close();
+      }
+
+      // ===================================================================
+      // 场景 K：保存请求没有可靠结论——一律按「无法确认」处理：
+      //   只有 HTTP 400 且有可读原因才是明确拒绝；500/502 等非成功状态即使
+      //   带有可解析的错误说明也不能声称资料保持原样；空回复、无法解析内容、
+      //   成功状态却无有效数量、连接中断同样无法确认。页面保留结果处理时的
+      //   勾选/字段操作/已填内容，不清表、不重发、不显示成功数量。
+      // ===================================================================
+
+      // K1：HTTP 500 + 可解析错误说明（最关键的回归点）
+      {
+        const session = await openSession(browser, base);
+        const {page, modes} = session;
+        await selectRows(page, [a, b]);
+        await chooseSet(page, "source", "500 时也可能已经写入的来源");
+        await chooseClear(page, "industry");
+        const beforePosts = session.counts.batchPosts;
+        modes.batchOverride = {status: 500,
+          body: JSON.stringify({error: "模拟 500：数据库暂时不可用"})};
+        await saveAndSettle(session);
+        const snap = await snapshot(page);
+
+        check("K1 500 可解析错误：按无法确认提示并要求先核对客户列表",
+          unconfirmedBanner(snap), snap.banners);
+        check("K1 500 可解析错误：提示保留已知 HTTP 状态与可读错误说明",
+          snap.reportText.includes("HTTP 500") &&
+          snap.reportText.includes("数据库暂时不可用"),
+          snap.reportText);
+        check("K1 500：不声称全部拒绝/资料保持原样，不显示成功数量",
+          !/全部拒绝|保持原样/.test(snap.reportText) &&
+          !/已成功处理/.test(snap.reportText),
+          snap.reportText);
+        check("K1 500：勾选（2 名）、来源 set 已填内容、行业 clear 全部保留，按钮可提交",
+          retainedState(snap, {count: 2, ops: [
+            ["source", "set", "500 时也可能已经写入的来源"],
+            ["industry", "clear"],
+            ["region", "keep"],
+            ["important_date", "keep"],
+          ]}), {sel: snap.selCount, fields: snap.fields, disabled: snap.submitDisabled});
+        check("K1 500：旧表三行保留、不显示空列表或读取失败提示",
+          snap.rows.length === 3 && !snap.emptyOn && !snap.loadErrorOn,
+          {rows: snap.rows.length, empty: snap.emptyOn, err: snap.loadErrorOn});
+        check("K1 500：保存后不触发列表刷新、不重发保存请求",
+          session.counts.listGets === 1 &&
+          session.counts.batchPosts === beforePosts + 1,
+          {list: session.counts.listGets, posts: session.counts.batchPosts});
+
+        // 用户核对后主动再次保存：使用保留的勾选与填写，真实成功后正常清理
+        modes.batchOverride = null;
+        await saveAndSettle(session);
+        const again = await snapshot(page);
+        check("K1 500 后主动重存：用保留的选择与填写成功（2 名）并完成清理",
+          successBanner(again, 2) && cleanedUp(again),
+          {banners: again.banners, sel: again.selCount, fields: again.fields});
+        const realK1 = await listClients(base);
+        check("K1 重存后：来源落库、行业清空",
+          realK1.clients.find(x => x.id === a).source === "500 时也可能已经写入的来源" &&
+          realK1.clients.find(x => x.id === b).source === "500 时也可能已经写入的来源" &&
+          realK1.clients.find(x => x.id === a).industry === null,
+          realK1.clients);
+        await page.close();
+      }
+
+      // K2：HTTP 502 + 纯文本可读说明
+      {
+        const session = await openSession(browser, base);
+        const {page, modes} = session;
+        await selectRows(page, [a, c]);
+        await chooseSet(page, "region", "502 网关来源文本");
+        modes.batchOverride = {status: 502, ct: "text/plain; charset=utf-8",
+          body: "网关临时故障，请稍后确认"};
+        await saveAndSettle(session);
+        const snap = await snapshot(page);
+
+        check("K2 502 纯文本：按无法确认处理", unconfirmedBanner(snap), snap.banners);
+        check("K2 502 纯文本：保留 HTTP 502 状态与可读文本说明",
+          snap.reportText.includes("HTTP 502") &&
+          snap.reportText.includes("网关临时故障，请稍后确认"),
+          snap.reportText);
+        check("K2 502：勾选与填写保留（2 名、地区 set），按钮可提交",
+          retainedState(snap, {count: 2, ops: [
+            ["region", "set", "502 网关来源文本"], ["source", "keep"]]}),
+          {sel: snap.selCount, fields: snap.fields});
+        check("K2 502：旧表保留、不触发列表刷新、不重发",
+          snap.rows.length === 3 && session.counts.listGets === 1,
+          {rows: snap.rows.length, list: session.counts.listGets});
+        await page.close();
+      }
+
+      // K3：非成功状态 + 没有可用说明（空回复 / 无法解析内容 / JSON 无 error）
+      for (const [label, override, phrase] of [
+        ["空回复", {status: 500, body: ""}, "没有给出可展示的错误说明"],
+        ["不可解析内容", {status: 503, ct: "text/html; charset=utf-8",
+          body: "<html><body>503 Service Unavailable</body></html>"},
+          "503 Service Unavailable"],
+        ["JSON 无错误说明", {status: 500, body: JSON.stringify({unexpected: true})},
+          "没有给出可展示的错误说明"],
+      ]) {
+        const session = await openSession(browser, base);
+        const {page, modes} = session;
+        await selectRows(page, [b]);
+        await chooseSet(page, "industry", "无说明也保留的行业");
+        modes.batchOverride = override;
+        await saveAndSettle(session);
+        const snap = await snapshot(page);
+
+        check(`K3 ${label}：按无法确认处理，不说成明确拒绝`,
+          unconfirmedBanner(snap), snap.banners);
+        check(`K3 ${label}：提示含 HTTP ${override.status} 与通用/已知说明，不出现 undefined/NaN/[object`,
+          snap.reportText.includes("HTTP " + override.status) &&
+          snap.reportText.includes(phrase) &&
+          !/undefined|NaN|\[object/.test(snap.reportText),
+          snap.reportText);
+        check(`K3 ${label}：勾选（1 名）与行业填写保留、按钮可提交、旧表保留`,
+          retainedState(snap, {count: 1, ops: [
+            ["industry", "set", "无说明也保留的行业"]]}) &&
+          snap.rows.length === 3 && !snap.emptyOn,
+          {sel: snap.selCount, fields: snap.fields, rows: snap.rows.length});
+        await page.close();
+      }
+
+      // K4：HTTP 400 但没有可读拒绝原因（空回复 / 无法解析）——不能当成明确拒绝
+      for (const [label, override] of [
+        ["400 空回复", {status: 400, body: ""}],
+        ["400 不可解析", {status: 400, ct: "text/plain; charset=utf-8", body: "   "}],
+      ]) {
+        const session = await openSession(browser, base);
+        const {page, modes} = session;
+        await selectRows(page, [a, b]);
+        await chooseSet(page, "source", "400 无原因也不能断言未变");
+        modes.batchOverride = override;
+        await saveAndSettle(session);
+        const snap = await snapshot(page);
+
+        check(`K4 ${label}：按无法确认而非全部拒绝处理`,
+          unconfirmedBanner(snap) && !/全部拒绝|保持原样/.test(snap.reportText),
+          snap.banners);
+        check(`K4 ${label}：勾选与填写保留、按钮可提交`,
+          retainedState(snap, {count: 2, ops: [
+            ["source", "set", "400 无原因也不能断言未变"]]}),
+          {sel: snap.selCount, fields: snap.fields});
+        await page.close();
+      }
+
+      // K5：成功状态但回复无法解析 / 缺少有效处理数量——仍按无法确认
+      for (const [label, override, phrase] of [
+        ["200 不可解析", {status: 200, ct: "text/plain; charset=utf-8",
+          body: "<<<not valid json>>>"}, "回复内容无法解析"],
+        ["200 缺数量", {status: 200, body: JSON.stringify({unexpected: true})},
+          "没有有效的处理数量"],
+        ["200 空回复", {status: 200, body: ""}, "回复内容无法解析"],
+      ]) {
+        const session = await openSession(browser, base);
+        const {page, modes} = session;
+        await selectRows(page, [c]);
+        await chooseSet(page, "important_date", "2030-01-02");
+        modes.batchOverride = override;
+        await saveAndSettle(session);
+        const snap = await snapshot(page);
+
+        check(`K5 ${label}：按无法确认处理、不显示成功数量`,
+          unconfirmedBanner(snap) && !/已成功处理/.test(snap.reportText),
+          snap.banners);
+        check(`K5 ${label}：说明已返回成功状态但${phrase}`,
+          snap.reportText.includes("成功状态") && snap.reportText.includes(phrase),
+          snap.reportText);
+        check(`K5 ${label}：不做成功后清理——勾选与日期填写保留、按钮可提交`,
+          retainedState(snap, {count: 1, ops: [
+            ["important_date", "set", "2030-01-02"]]}),
+          {sel: snap.selCount, fields: snap.fields});
+        check(`K5 ${label}：旧表保留、未触发保存后的列表刷新`,
+          snap.rows.length === 3 && session.counts.listGets === 1,
+          {rows: snap.rows.length, list: session.counts.listGets});
+
+        // 取消全部勾选后：按钮恢复禁用——可提交性只取决于当前是否有勾选
+        await page.evaluate(() => {
+          document.querySelectorAll("#clients-body .row-check:checked")
+            .forEach(c => c.click());
+        });
+        const none = await snapshot(page);
+        check(`K5 ${label}：此时取消勾选，按钮恢复不可提交`,
+          none.selCount === "0" && none.submitDisabled &&
+          none.submitText === "保存修改",
+          {sel: none.selCount, disabled: none.submitDisabled});
+        await page.close();
+      }
+
+      // K6：保存请求连接中断（收不到任何响应）
+      {
+        const session = await openSession(browser, base);
+        const {page, modes} = session;
+        await selectRows(page, [a, b, c]);
+        await chooseSet(page, "source", "断连时不知是否写入");
+        const beforePosts = session.counts.batchPosts;
+        modes.batchAbort = true;
+        await saveAndSettle(session);
+        const snap = await snapshot(page);
+
+        check("K6 连接中断：按无法确认处理", unconfirmedBanner(snap), snap.banners);
+        check("K6 连接中断：不显示成功数量、不声称资料保持原样、无 undefined",
+          !/已成功处理|保持原样|undefined|NaN/.test(snap.reportText),
+          snap.reportText);
+        check("K6 连接中断：勾选（3 名）与填写保留、按钮恢复可提交",
+          retainedState(snap, {count: 3, ops: [
+            ["source", "set", "断连时不知是否写入"]]}),
+          {sel: snap.selCount, fields: snap.fields});
+        check("K6 连接中断：不自动重发、不刷新列表、旧表保留",
+          session.counts.batchPosts === beforePosts + 1 &&
+          session.counts.listGets === 1 && snap.rows.length === 3,
+          {posts: session.counts.batchPosts, list: session.counts.listGets});
+        await page.close();
+      }
+
+      // K7：等待期间用户改选客户/调整填写，结果为 500——保留的是结果处理时
+      //     页面上的内容，不恢复成提交时的旧选择，也不自动补交
+      {
+        const session = await openSession(browser, base);
+        const {page, modes} = session;
+        await selectRows(page, [a, b]);
+        await chooseSet(page, "source", "提交时的来源");
+        await chooseClear(page, "industry");
+
+        modes.batchHold = true;
+        await page.click("#batch-submit");
+        const heldReq = await waitForHeld(session);
+        const sent = JSON.parse(heldReq.payload);
+        check("K7 等待中：发出的请求锁定为提交时的勾选与填写",
+          JSON.stringify(sent.ids) === JSON.stringify([a, b]) &&
+          sent.updates.source.value === "提交时的来源" &&
+          sent.updates.industry.op === "clear",
+          sent);
+
+        // 等待期间：取消甲、改勾丙，来源改写、地区改 set
+        await selectRows(page, [a, c]);
+        await page.evaluate(() => {
+          document.querySelector('#batch-fields .bf[data-field="source"] .bf-value')
+            .value = "结果返回时的来源";
+        });
+        await chooseSet(page, "region", "结果返回时的地区");
+
+        // 直接给挂起的请求答复 500（不经过真实后端）
+        modes.batchHold = false;
+        heldReq.request.respond({status: 500,
+          contentType: "application/json; charset=utf-8",
+          body: JSON.stringify({error: "模拟 500：提交后服务异常"})});
+        await waitSaveDone(page);
+        const snap = await snapshot(page);
+
+        check("K7 500 返回：按无法确认处理", unconfirmedBanner(snap), snap.banners);
+        check("K7 500 返回：保留的是结果处理时页面上的勾选（乙、丙），不恢复提交时的甲、乙",
+          snap.selCount === "2" &&
+          !snap.rows.find(r => r.id === String(a)).checked &&
+          snap.rows.find(r => r.id === String(b)).checked &&
+          snap.rows.find(r => r.id === String(c)).checked,
+          {sel: snap.selCount, rows: snap.rows.map(r => [r.id, r.checked])});
+        check("K7 500 返回：保留结果处理时的字段操作与填写（来源改写值、地区 set、行业 clear）",
+          snap.fields.find(f => f.key === "source").op === "set" &&
+          snap.fields.find(f => f.key === "source").value === "结果返回时的来源" &&
+          snap.fields.find(f => f.key === "region").op === "set" &&
+          snap.fields.find(f => f.key === "region").value === "结果返回时的地区" &&
+          snap.fields.find(f => f.key === "industry").op === "clear",
+          snap.fields);
+        check("K7 500 返回：按钮恢复且可提交、全程仅 1 次请求、无列表刷新",
+          snap.submitText === "保存修改" && !snap.submitDisabled &&
+          session.counts.batchPosts === 1 && session.counts.listGets === 1,
+          {text: snap.submitText, posts: session.counts.batchPosts,
+            list: session.counts.listGets});
+
+        // 用户主动再次保存：使用当前（乙、丙）选择与填写，真实成功
+        modes.batchHold = false;
+        await saveAndSettle(session);
+        const again = await snapshot(page);
+        check("K7 主动重存：按当前乙、丙与当前填写成功（2 名）并清理",
+          successBanner(again, 2) && cleanedUp(again),
+          {banners: again.banners, sel: again.selCount});
+        const realK7 = await listClients(base);
+        check("K7 重存后：乙、丙来源为结果时改写值且地区被设置；甲不被补交",
+          realK7.clients.find(x => x.id === b).source === "结果返回时的来源" &&
+          realK7.clients.find(x => x.id === c).source === "结果返回时的来源" &&
+          realK7.clients.find(x => x.id === b).region === "结果返回时的地区" &&
+          realK7.clients.find(x => x.id === c).region === "结果返回时的地区" &&
+          realK7.clients.find(x => x.id === a).source !== "结果返回时的来源",
+          realK7.clients.map(x => ({id: x.id, s: x.source, r: x.region})));
         await page.close();
       }
 
