@@ -391,6 +391,63 @@ function showReport(innerHTML, ok) {
   report.innerHTML = innerHTML;
 }
 
+// 数量必须是非负整数：缺失、布尔、浮点、负数或 NaN/Infinity 都不算合法数量。
+function isNonNegativeInt(value) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+// 只有成功状态下、且报告通过完整校验时才算拿到可靠的导入结果：
+// 新增/未导入数量为非负整数；未导入明细是数组，逐条含正整数数据记录编号与
+// 非空文本原因；明细条数与未导入数量一致。任一不满足都返回 null，
+// 不用 0、空数组或 undefined 补造一份成功报告。
+function parseImportReport(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const importedCount = data.imported_count;
+  const failedCount = data.failed_count;
+  if (!isNonNegativeInt(importedCount) || !isNonNegativeInt(failedCount)) return null;
+  if (!Array.isArray(data.failures) || data.failures.length !== failedCount) return null;
+  const failures = [];
+  for (const item of data.failures) {
+    if (!item || typeof item !== "object") return null;
+    if (typeof item.row !== "number" || !Number.isInteger(item.row) || item.row <= 0) return null;
+    if (typeof item.reason !== "string" || !item.reason.trim()) return null;
+    failures.push({row: item.row, reason: item.reason});
+  }
+  return {importedCount, failedCount, failures};
+}
+
+// 错误状态回复可能是 {error: "..."}，也可能只有一段纯文本错误说明。
+function readableError(data, raw) {
+  if (data && typeof data === "object" && !Array.isArray(data) &&
+      typeof data.error === "string" && data.error.trim()) {
+    return data.error;
+  }
+  const text = (raw || "").trim();
+  return text ? text.slice(0, 200) : "";
+}
+
+// 记录级失败（重复、字段错误）仍属于成功导入报告：合法的零新增、全部跳过与
+// 部分新增都按已校验的数量展示，并逐条列出原因，不把记录失败说成整份拒绝。
+function successReportHtml(report) {
+  let html = '<div class="banner ok">新增 <b>' + report.importedCount + "</b> 条，" +
+    "未导入 <b>" + report.failedCount + "</b> 条。</div>";
+  if (report.failures.length) {
+    html += '<div class="failures"><p><b>未导入记录（编号按原文件数据记录，表头不计入）：</b></p><ul>';
+    html += report.failures.map(f =>
+      "<li>第 <b>" + esc(f.row) + "</b> 条：" + esc(f.reason) + "</li>").join("");
+    html += "</ul></div>";
+  }
+  return html;
+}
+
+// 成功状态之外的统一口径：没有取得可靠结果，不显示任何成功数量，也不断言
+// 资料一定未变化；提示先核对客户列表，不自动补交文件。
+function unreliableReportHtml(prefix) {
+  return '<div class="banner bad">' + prefix +
+    "没有取得可靠的导入结果，无法确认本次是否新增了客户；请先核对客户列表，" +
+    "再决定是否重新导入。已选文件保留，不会自动重新提交。</div>";
+}
+
 document.getElementById("import-form").addEventListener("submit", async e => {
   e.preventDefault();
   const input = document.getElementById("file-input");
@@ -402,44 +459,73 @@ document.getElementById("import-form").addEventListener("submit", async e => {
   }
   btn.disabled = true;
   try {
-    const res = await fetch("/api/clients/import", {method: "POST", body: file});
-    const data = await res.json();
-    renderReport(data, res.status);
-    if (res.ok) {
-      // 导入结果已明确后，列表读取失败只补充提示，不把已成功的导入改写成请求失败。
+    let res;
+    try {
+      res = await fetch("/api/clients/import", {method: "POST", body: file});
+    } catch (netErr) {
+      // 请求未拿到任何回复：不知道服务是否处理过文件，不能声称资料未变。
+      showReport(unreliableReportHtml("导入请求失败（" + esc(netErr.message) + "）："));
+      return;
+    }
+
+    // 先取原文再尝试解析：非成功状态可能只返回一段纯文本错误说明。
+    const raw = await res.text().catch(() => "");
+    let data = null;
+    if (raw.trim()) {
       try {
-        await loadClients();
-      } catch (loadErr) {
-        showReport(
-          (document.getElementById("report").innerHTML) +
-          '<div class="banner warn">导入后读取客户列表失败（' + esc(loadErr.message) +
-          "）：列表暂未更新，当前显示的资料可能不是最新内容；导入结果以上述报告为准，稍后刷新页面即可。</div>");
+        data = JSON.parse(raw);
+      } catch {
+        data = null;
       }
     }
+
+    if (res.status === 400) {
+      // 现有约定：HTTP 400 表示整份文件拒绝，本次没有新增客户，资料保持原样。
+      const reason = readableError(data, raw) || "服务未给出具体原因";
+      showReport('<div class="banner bad">整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。<br>原因：' +
+        esc(reason) + "</div>");
+      return;
+    }
+
+    if (!res.ok) {
+      // 其他非成功状态：即使回复可解析，也不显示成功数量、不断言资料一定未变。
+      const detail = readableError(data, raw) || "服务未给出可展示的错误说明";
+      showReport(unreliableReportHtml("导入未成功（HTTP " + res.status + "）：" +
+        esc(detail) + "。<br>"));
+      return;
+    }
+
+    // 成功状态：只有报告完整可校验时才显示新增/未导入数量与逐条原因。
+    const report = parseImportReport(data);
+    if (!report) {
+      const problem = data === null
+        ? "回复内容无法解析"
+        : "导入报告不完整，或数量、未导入明细不符合约定";
+      showReport('<div class="banner bad">导入请求已返回成功状态，但' + problem +
+        "：本次导入是否生效、新增了多少客户均无法确认，不能按零新增或空明细补算成功结果；" +
+        "请先核对客户列表，再决定是否重新导入。已选文件保留，不会自动重新提交。</div>");
+      return;
+    }
+
+    showReport(successReportHtml(report));
+    // 成功结论只以已校验的报告为准：随后列表读取失败只附加提示，
+    // 保留已确认的数量、逐条原因与原有表格，不把导入改说成失败。
+    try {
+      await loadClients();
+    } catch (loadErr) {
+      showReport(
+        document.getElementById("report").innerHTML +
+        '<div class="banner warn">导入后读取客户列表失败（' + esc(loadErr.message) +
+        "）：列表暂未更新，当前显示的资料可能不是最新内容；导入结果以上述报告为准，" +
+        "稍后刷新页面即可，无需重新导入。</div>");
+    }
   } catch (err) {
-    showReport('<div class="banner bad">导入请求失败：' + esc(err.message) + '</div>');
+    showReport(unreliableReportHtml("导入处理出现意外问题（" + esc(err.message) + "）："));
   } finally {
+    // 无论结果如何都结束导入等待；不清空已选文件，由用户主动处理。
     btn.disabled = false;
   }
 });
-
-function renderReport(data, status) {
-  if (status === 400) {
-    showReport('<div class="banner bad">整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。<br>原因：' +
-      esc(data.error || "未知错误") + '</div>');
-    return;
-  }
-  const failures = data.failures || [];
-  let out = '<div class="banner ok">新增 <b>' + esc(data.imported_count) + '</b> 条，' +
-    '未导入 <b>' + failures.length + '</b> 条。</div>';
-  if (failures.length) {
-    out += '<div class="failures"><p><b>未导入记录（编号按原文件数据记录，表头不计入）：</b></p><ul>';
-    out += failures.map(f =>
-      "<li>第 <b>" + esc(f.row) + "</b> 条：" + esc(f.reason) + "</li>").join("");
-    out += "</ul></div>";
-  }
-  showReport(out);
-}
 
 // 首次读取失败时页内已显示读取失败提示且表格保持空白/原状，这里吞掉拒绝即可，
 // 不使用弹窗、不清空任何已有内容。
