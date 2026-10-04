@@ -2,9 +2,11 @@
   "name": "clientbook-page-tests",
   "version": "1.0.0",
   "private": true,
-  "description": "ClientBook 首页批量保存的页面层面回归测试（Puppeteer 驱动系统 Chrome，后端为真实 app.py）",
+  "description": "ClientBook 首页批量保存与 CSV 导入结果展示的页面层面回归测试（Puppeteer 驱动系统 Chrome，后端为真实 app.py）",
   "scripts": {
-    "test": "node page_test.mjs"
+    "test": "node page_test.mjs && node import_test.mjs",
+    "test:page": "node page_test.mjs",
+    "test:import": "node import_test.mjs"
   },
   "dependencies": {
     "puppeteer": "^25.12.0"
