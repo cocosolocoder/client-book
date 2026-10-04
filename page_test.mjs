@@ -19,7 +19,15 @@
  *    真实空列表正常显示空列表提示，不被当成读取失败；
  * 5. 保存成功且列表读取成功：显示处理数量、更新相关列、完成同样的勾选与编辑清理；
  * 6. 保存接口明确拒绝（HTTP 400 具体原因）：保留勾选、字段操作与已填内容供修正，
- *    不套用保存成功后的清理与提示。
+ *    不套用保存成功后的清理与提示；
+ * 7. 保存请求尚未返回（等待期）：按钮显示「正在保存…」且不可再次保存，勾选信息、
+ *    字段操作与填写内容原样保留、不显示成功数量；等待期内重复点击、输入框回车或直接
+ *    触发表单提交都不能产生第二次修改请求，等待提示也不被替换成成功或「未选客户」错误；
+ *    等待期内取消原勾选、勾选第三名客户、调整字段操作与输入都正常体现在页面上，但不解除
+ *    等待；实际修改对象与字段值始终以第一次保存固化的请求为准（后勾客户不更新、后填值不
+ *    替换、未改字段保留各客户原值），结果返回后不自动补交等待期间的改动；400 拒绝时显示
+ *    具体原因、资料不变、保留返回结果时页面上的勾选与填写，等待结束后有选中客户才能再次
+ *    保存。判定以实际发出的请求（次数与请求体）及后端客户资料为准，不仅凭按钮外观。
  */
 import {spawn} from "node:child_process";
 import {dirname, join} from "node:path";
@@ -121,8 +129,24 @@ async function openSession(browser, base) {
     list: "ok",
     // batch 响应改写：null = 走真实后端；否则用给定 {status, body}
     batchOverride: null,
+    // batch 挂起：true 时修改请求先扣在拦截器里不转发，直到 batchGate 放行
+    batchHold: false,
   };
   const counts = {batchPosts: 0, listGets: 0};
+  // 每次挂起的修改请求记录：{payload, release(override?)}
+  const heldBatches = [];
+  const gate = {
+    held: heldBatches,
+    holdOn() { modes.batchHold = true; },
+    holdOff() { modes.batchHold = false; },
+    // 放行挂起请求：override=null 转发给真实后端；否则用 {status, body} 就地应答
+    async release(index = 0, override = null) {
+      const held = heldBatches[index];
+      if (!held) throw new Error(`没有第 ${index} 个挂起的修改请求（共 ${heldBatches.length} 个）`);
+      await held.release(override);
+      heldBatches.splice(index, 1);
+    },
+  };
 
   await page.setRequestInterception(true);
   page.on("request", request => {
@@ -150,18 +174,46 @@ async function openSession(browser, base) {
     }
     if (request.method() === "POST" && url.endsWith("/api/clients/batch-update")) {
       counts.batchPosts += 1;
-      if (modes.batchOverride) {
-        const {status, body} = modes.batchOverride;
-        request.respond({status, contentType: "application/json; charset=utf-8", body});
+      let payload = null;
+      try { payload = JSON.parse(request.postData() || "{}"); } catch { payload = null; }
+      const done = () => {
+        if (modes.batchOverride) {
+          const {status, body} = modes.batchOverride;
+          request.respond({status, contentType: "application/json; charset=utf-8", body});
+          return;
+        }
+        request.continue();
+      };
+      if (modes.batchHold) {
+        // 扣住请求不放行：页面应一直处于等待状态，直到测试显式 release
+        const entry = {
+          payload,
+          release: override => new Promise(resolve => {
+            if (override) {
+              request.respond({
+                status: override.status,
+                contentType: "application/json; charset=utf-8",
+                body: override.body,
+              });
+            } else {
+              request.continue();
+            }
+            // 等转发/应答真正被浏览器消化，避免后续断言赶在落库前
+            setTimeout(resolve, 30);
+          }),
+        };
+        heldBatches.push(entry);
         return;
       }
+      done();
+      return;
     }
     request.continue();
   });
 
   await page.setCacheEnabled(false);
   await page.goto(base + "/", {waitUntil: "networkidle0"});
-  return {page, modes, counts};
+  return {page, modes, counts, gate};
 }
 
 // 读取批量保存区域的全部可见状态
@@ -227,6 +279,107 @@ async function chooseClear(page, key) {
   await page.evaluate(key => {
     document.querySelector(`#batch-fields .bf[data-field="${key}"] input[value=clear]`).click();
   }, key);
+}
+
+// 选择「设为填写的值」并用真实键盘输入（而非直接赋值），覆盖 focus/键入过程
+async function chooseSetAndType(page, key, value) {
+  await page.evaluate(key => {
+    document.querySelector(`#batch-fields .bf[data-field="${key}"] input[value=set]`).click();
+  }, key);
+  await page.focus(`.bf[data-field="${key}"] .bf-value`);
+  await page.keyboard.type(value);
+}
+
+// 全选输入框现有内容后用键盘替换
+async function replaceFieldByTyping(page, key, value) {
+  const handle = await page.$(`.bf[data-field="${key}"] .bf-value`);
+  await handle.click();
+  await page.keyboard.down("Control");
+  await page.keyboard.press("A");
+  await page.keyboard.up("Control");
+  await page.keyboard.press("Backspace");
+  await page.keyboard.type(value);
+}
+
+async function uncheckRows(page, ids) {
+  await page.evaluate(ids => {
+    for (const id of ids) {
+      const box = document.querySelector(`#clients-body tr[data-id="${id}"] .row-check`);
+      if (box && box.checked) box.click();
+    }
+  }, ids);
+}
+
+// 保存按钮 disabled 时真实点击与回车都到不了处理函数；requestSubmit 能绕过 disabled
+// 直达提交处理函数——用它专门压处理函数自身的重入保护（若保护缺失就会发出第二次请求）。
+async function dispatchFormSubmit(page) {
+  await page.evaluate(() => {
+    const form = document.getElementById("batch-form");
+    form.requestSubmit();
+  });
+}
+
+async function pressEnterInField(page, key) {
+  await page.focus(`.bf[data-field="${key}"] .bf-value`);
+  await page.keyboard.press("Enter");
+}
+
+async function waitForHeld(gate, n = 1, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (gate.held.length >= n) return;
+    await new Promise(r => setTimeout(r, 20));
+  }
+  throw new Error(`等待中的修改请求未达到 ${n} 个（实际 ${gate.held.length}）`);
+}
+
+async function waitSaving(page) {
+  await page.waitForFunction(
+    () => {
+      const btn = document.getElementById("batch-submit");
+      return btn.textContent === "正在保存…" && btn.disabled;
+    },
+    {timeout: 3000});
+}
+
+async function waitSettled(page, timeoutMs = 5000) {
+  await page.waitForFunction(
+    () => document.getElementById("batch-submit").textContent === "保存修改",
+    {timeout: timeoutMs});
+  await new Promise(r => setTimeout(r, 50)); // 让横幅/列表渲染稳定
+}
+
+const FIELD_KEYS = ["source", "region", "industry", "important_date"];
+
+// 校验拦截到的请求体：客户编号集合与逐字段操作/填写值必须与期望完全一致
+function payloadProblems(actual, expectedIds, expectedUpdates) {
+  const problems = [];
+  if (!actual || typeof actual !== "object") {
+    return ["请求体不是 JSON 对象：" + JSON.stringify(actual)];
+  }
+  const ids = Array.isArray(actual.ids) ? [...actual.ids].sort((x, y) => x - y) : null;
+  const wantIds = [...expectedIds].sort((x, y) => x - y);
+  if (JSON.stringify(ids) !== JSON.stringify(wantIds)) {
+    problems.push(`ids=${JSON.stringify(ids)}，期望 ${JSON.stringify(wantIds)}`);
+  }
+  const updates = actual.updates || {};
+  for (const key of FIELD_KEYS) {
+    const got = updates[key] || {};
+    const want = expectedUpdates[key] || {op: "keep"};
+    if (got.op !== want.op) {
+      problems.push(`${key}.op=${got.op}，期望 ${want.op}`);
+    } else if (want.op === "set" && got.value !== want.value) {
+      problems.push(`${key}.value=${JSON.stringify(got.value)}，期望 ${JSON.stringify(want.value)}`);
+    }
+  }
+  return problems;
+}
+
+function busyBannerOnly(snap) {
+  return snap.banners.length === 1 &&
+    snap.banners[0].cls.includes("busy") &&
+    snap.banners[0].text.includes("正在保存") &&
+    !/已成功处理|全部拒绝|请求失败|请先勾选/.test(snap.reportText);
 }
 
 async function saveAndSettle(session) {
@@ -598,6 +751,354 @@ async function run() {
         check("G 回复 5 名：勾选与编辑同样完成清理、按钮恢复禁用",
           cleanedUp(snap), {sel: snap.selCount, fields: snap.fields});
         await page.close();
+      }
+
+      // ===================================================================
+      // 等待期回归（保存请求尚未返回）：独立应用 + 三名资料各异的客户
+      //
+      //   I：成功路径。首次保存 ids=[p1,p2]、来源 set「  等待期新来源  」、
+      //      行业 clear、地区/日期 keep；等待期内重复提交（点击/回车/直达处理函数）、
+      //      取消原勾选、勾选 p3、取消全部再重选、调整字段操作与输入——
+      //      都只能有这一次请求，处理对象与值以首次固化内容为准，返回后不补交。
+      //   J：400 拒绝路径。拒绝后保留返回结果时页面上的勾选/操作/填写，
+      //      有勾选才能再次保存；修正后能正常发起新请求。
+      //   K：等待结束时已无勾选：成功后按钮保持不可提交，等待期勾过的客户不更新。
+      // ===================================================================
+      {
+        const {proc: pendProc, port: pendPortP} = startApp("pending");
+        try {
+          const pendBase = `http://127.0.0.1:${await pendPortP}`;
+          await waitReady(pendBase);
+          const [p1, p2, p3] = await seed(pendBase, [
+            {name: "等待甲", source: "老客介绍", region: "华东", industry: "制造业", date: "2020-01-15"},
+            {name: "等待乙", source: "展会名片", region: "华南", industry: "零售业", date: "2021-06-30"},
+            {name: "等待丙", source: "线上广告", region: "华北", industry: "互联网", date: "2022-12-01"},
+          ]);
+          const firstUpdates = {
+            source: {op: "set", value: "  等待期新来源  "},
+            region: {op: "keep"},
+            industry: {op: "clear"},
+            important_date: {op: "keep"},
+          };
+
+          // ---------------------------------------------------------------
+          // 场景 I：等待期全行为（成功）
+          // ---------------------------------------------------------------
+          {
+            const session = await openSession(browser, pendBase);
+            const {page, gate} = session;
+            await selectRows(page, [p1, p2]);
+            await chooseSet(page, "source", "  等待期新来源  ");
+            await chooseClear(page, "industry");
+            const edited = await snapshot(page);
+            check("I 填写后：已选 2、按钮可提交、来源带空格文本、行业清空",
+              edited.selCount === "2" && !edited.submitDisabled &&
+              edited.fields.find(f => f.key === "source").value === "  等待期新来源  " &&
+              edited.fields.find(f => f.key === "industry").op === "clear" &&
+              edited.fields.find(f => f.key === "region").op === "keep" &&
+              edited.fields.find(f => f.key === "important_date").op === "keep",
+              edited.fields);
+
+            // 挂起保存请求：先不转发给真实后端
+            const beforePosts = session.counts.batchPosts;
+            gate.holdOn();
+            await page.click("#batch-submit");
+            await waitForHeld(gate, 1);
+            await waitSaving(page);
+            const w1 = await snapshot(page);
+
+            check("I 等待中：按钮显示「正在保存…」且不可再次保存",
+              w1.submitText === "正在保存…" && w1.submitDisabled,
+              {text: w1.submitText, disabled: w1.submitDisabled});
+            check("I 等待中：只显示等待提示，不显示成功数量，也没有拒绝/未选客户错误",
+              busyBannerOnly(w1), w1.banners);
+            check("I 等待中：选中信息保留（已选 2，两名客户都在）",
+              w1.selCount === "2" && w1.selChips.length === 2 &&
+              w1.selChips.some(t => t.includes(`#${p1}`)) &&
+              w1.selChips.some(t => t.includes(`#${p2}`)) &&
+              w1.rows.filter(r => r.checked).map(r => r.id).sort().join(",") ===
+                [p1, p2].sort().join(","),
+              {count: w1.selCount, chips: w1.selChips,
+               checked: w1.rows.filter(r => r.checked).map(r => r.id)});
+            check("I 等待中：字段操作与填写内容原样保留（来源 set 文本仍在、行业仍 clear）",
+              w1.fields.find(f => f.key === "source").op === "set" &&
+              w1.fields.find(f => f.key === "source").value === "  等待期新来源  " &&
+              !w1.fields.find(f => f.key === "source").disabled &&
+              w1.fields.find(f => f.key === "industry").op === "clear",
+              w1.fields);
+            check("I 等待中：修改请求只发出 1 次且尚未到达服务（挂起 1 个）",
+              session.counts.batchPosts === beforePosts + 1 && gate.held.length === 1,
+              `posts=${session.counts.batchPosts}, held=${gate.held.length}`);
+            const bodyProblems = payloadProblems(gate.held[0].payload, [p1, p2], firstUpdates);
+            check("I 等待中：挂起的请求体正是首次勾选与填写（ids/逐字段操作与值完全一致）",
+              bodyProblems.length === 0, bodyProblems);
+            const before = await listClients(pendBase);
+            check("I 等待中：后端客户资料此刻完全未变（请求尚未放行）",
+              before.clients.find(x => x.id === p1).source === "老客介绍" &&
+              before.clients.find(x => x.id === p1).industry === "制造业" &&
+              before.clients.find(x => x.id === p2).source === "展会名片" &&
+              before.clients.find(x => x.id === p3).source === "线上广告",
+              before.clients);
+
+            // 等待期内重复提交：真实点击按钮、输入框回车（隐式提交）、绕过 disabled
+            // 直达提交处理函数——三种方式都不能产生第二次修改请求。
+            await page.click("#batch-submit"); // disabled：真实点击应无效
+            // 等待期把重要日期切成 set（允许的字段调整），其单行文本框回车才是真实隐式提交
+            await chooseSetAndType(page, "important_date", "2025-01-01");
+            await pressEnterInField(page, "important_date");
+            await dispatchFormSubmit(page); // requestSubmit 绕过按钮 disabled，直压处理函数
+            await new Promise(r => setTimeout(r, 60));
+            const w1b = await snapshot(page);
+            check("I 重复提交（点击/回车/直达处理函数）：未发出第二次修改请求（计数与挂起数不变）",
+              session.counts.batchPosts === beforePosts + 1 && gate.held.length === 1,
+              `posts=${session.counts.batchPosts}, held=${gate.held.length}`);
+            check("I 重复提交后：按钮仍等待禁用，等待提示未被成功或未选客户错误替换",
+              w1b.submitText === "正在保存…" && w1b.submitDisabled && busyBannerOnly(w1b),
+              {text: w1b.submitText, banners: w1b.banners});
+
+            // 等待期内改变勾选与字段：页面正常反映，但不解除等待
+            await uncheckRows(page, [p1]);      // 取消原来的勾选之一
+            await selectRows(page, [p3]);       // 勾选第三名客户
+            await replaceFieldByTyping(page, "source", "等待期改的来源"); // 改已提交字段的值
+            await chooseSetAndType(page, "region", "等待期地区");         // 把 keep 改成 set
+            await new Promise(r => setTimeout(r, 30));
+            const w2 = await snapshot(page);
+            check("I 等待期改动正常体现：已选为 p2/p3，p1 已取消，来源/地区/日期显示新操作与输入",
+              w2.selCount === "2" &&
+              w2.rows.find(r => r.id === String(p1)).checked === false &&
+              w2.rows.find(r => r.id === String(p2)).checked === true &&
+              w2.rows.find(r => r.id === String(p3)).checked === true &&
+              w2.selChips.some(t => t.includes(`#${p2}`)) &&
+              w2.selChips.some(t => t.includes(`#${p3}`)) &&
+              !w2.selChips.some(t => t.includes(`#${p1} `)) &&
+              w2.fields.find(f => f.key === "source").value === "等待期改的来源" &&
+              w2.fields.find(f => f.key === "region").op === "set" &&
+              w2.fields.find(f => f.key === "region").value === "等待期地区" &&
+              w2.fields.find(f => f.key === "important_date").value === "2025-01-01",
+              {count: w2.selCount, chips: w2.selChips, fields: w2.fields});
+            check("I 等待期改动后：按钮仍等待禁用、等待提示不变、请求仍只有 1 个",
+              w2.submitText === "正在保存…" && w2.submitDisabled && busyBannerOnly(w2) &&
+              session.counts.batchPosts === beforePosts + 1 && gate.held.length === 1,
+              {text: w2.submitText, posts: session.counts.batchPosts});
+
+            // 先取消全部勾选再重新选择：仍不能重新提交；全空时直达提交也不能把等待提示
+            // 换成「未选客户」错误（batchSaving 守护先于空勾选分支）。
+            await uncheckRows(page, [p2, p3]);
+            await new Promise(r => setTimeout(r, 30));
+            const w3 = await snapshot(page);
+            check("I 取消全部勾选：页面已选归零，但按钮等待状态不解除",
+              w3.selCount === "0" && w3.submitText === "正在保存…" && w3.submitDisabled,
+              {count: w3.selCount, text: w3.submitText});
+            await dispatchFormSubmit(page);
+            await pressEnterInField(page, "important_date");
+            await new Promise(r => setTimeout(r, 30));
+            const w3b = await snapshot(page);
+            check("I 全空时重复提交：不新增请求，等待提示不被「请先勾选」错误替换",
+              session.counts.batchPosts === beforePosts + 1 && gate.held.length === 1 &&
+              busyBannerOnly(w3b),
+              {posts: session.counts.batchPosts, banners: w3b.banners});
+            await selectRows(page, [p1, p2]); // 重新选择
+            await dispatchFormSubmit(page);
+            await page.click("#batch-submit");
+            await new Promise(r => setTimeout(r, 30));
+            check("I 重新勾选后再次提交：仍不能重新提交（请求计数与挂起数不变）",
+              session.counts.batchPosts === beforePosts + 1 && gate.held.length === 1,
+              `posts=${session.counts.batchPosts}, held=${gate.held.length}`);
+
+            // 放行首次（也是唯一一次）请求给真实后端
+            gate.holdOff();
+            await gate.release(0);
+            await waitSettled(page);
+            const done = await snapshot(page);
+
+            check("I 放行后：显示本次回复处理数量 2 名且说明列表已更新",
+              done.banners.some(x => x.cls.includes("ok") &&
+                /已成功处理\s*2\s*名客户/.test(x.text) && x.text.includes("列表已更新")),
+              done.banners);
+            check("I 放行后：勾选清空、四字段恢复保持原值/输入清空禁用、无勾选按钮不可提交",
+              cleanedUp(done), {sel: done.selCount, fields: done.fields,
+                text: done.submitText, disabled: done.submitDisabled});
+            check("I 放行后：全程修改请求仅 1 次，等待期间改动未被自动补交",
+              session.counts.batchPosts === beforePosts + 1,
+              `posts=${session.counts.batchPosts}`);
+
+            const after = await listClients(pendBase);
+            check("I 后端：p1/p2 按首次请求更新（来源去前后空白、行业清空）",
+              after.clients.find(x => x.id === p1).source === "等待期新来源" &&
+              after.clients.find(x => x.id === p1).industry === null &&
+              after.clients.find(x => x.id === p2).source === "等待期新来源" &&
+              after.clients.find(x => x.id === p2).industry === null,
+              after.clients);
+            check("I 后端：未修改字段保留各客户原有资料（地区、重要日期均不变）",
+              after.clients.find(x => x.id === p1).region === "华东" &&
+              after.clients.find(x => x.id === p1).important_date === "2020-01-15" &&
+              after.clients.find(x => x.id === p2).region === "华南" &&
+              after.clients.find(x => x.id === p2).important_date === "2021-06-30",
+              after.clients);
+            check("I 后端：后来勾选的 p3 未被更新；等待期改填的值一个都未入库",
+              after.clients.find(x => x.id === p3).source === "线上广告" &&
+              after.clients.find(x => x.id === p3).region === "华北" &&
+              after.clients.find(x => x.id === p3).industry === "互联网" &&
+              after.clients.find(x => x.id === p3).important_date === "2022-12-01" &&
+              JSON.stringify(after.clients).includes("等待期改的来源") === false &&
+              JSON.stringify(after.clients).includes("等待期地区") === false &&
+              JSON.stringify(after.clients).includes("2025-01-01") === false,
+              after.clients);
+            check("I 列表：呈现本次已提交修改（来源两行为新值、行业为空），p3 行原样",
+              done.rows.find(r => r.id === String(p1)).cells[1] === "等待期新来源" &&
+              done.rows.find(r => r.id === String(p1)).cells[3] === "—" &&
+              done.rows.find(r => r.id === String(p2)).cells[1] === "等待期新来源" &&
+              done.rows.find(r => r.id === String(p3)).cells[1] === "线上广告" &&
+              done.rows.find(r => r.id === String(p3)).cells[3] === "互联网",
+              done.rows);
+            await page.close();
+          }
+
+          // ---------------------------------------------------------------
+          // 场景 J：等待后被服务明确 400 拒绝——保留返回结果时的页面状态，
+          //         等待结束后有选中客户才能再次保存；修正后可发新请求
+          // ---------------------------------------------------------------
+          {
+            const session = await openSession(browser, pendBase);
+            const {page, gate} = session;
+            await selectRows(page, [p3]);
+            await chooseSetAndType(page, "important_date", "2023-02-29"); // 非闰年 → 400
+            const beforePosts = session.counts.batchPosts;
+            gate.holdOn();
+            await page.click("#batch-submit");
+            await waitForHeld(gate, 1);
+            await waitSaving(page);
+
+            // 等待期：加勾 p1、给来源设值；这些是「返回结果时页面上」的状态
+            await selectRows(page, [p1]);
+            await chooseSetAndType(page, "source", "拒绝等待期来源");
+            await dispatchFormSubmit(page); // 等待期重复提交仍被忽略
+            const wj = await snapshot(page);
+            check("J 等待中：加勾与填写正常体现但等待不解除、无第二次请求",
+              wj.selCount === "2" && wj.submitText === "正在保存…" && wj.submitDisabled &&
+              wj.fields.find(f => f.key === "source").value === "拒绝等待期来源" &&
+              session.counts.batchPosts === beforePosts + 1 && gate.held.length === 1,
+              {count: wj.selCount, fields: wj.fields, posts: session.counts.batchPosts});
+
+            // 放行给真实后端：首次请求 ids=[p3]、日期 2023-02-29 → 整次 400
+            const heldProblems = payloadProblems(gate.held[0].payload, [p3], {
+              source: {op: "keep"},
+              region: {op: "keep"},
+              industry: {op: "keep"},
+              important_date: {op: "set", value: "2023-02-29"},
+            });
+            check("J 被拒请求体：仍是首次提交（仅 p3、日期非法），不含等待期改动",
+              heldProblems.length === 0, heldProblems);
+            gate.holdOff();
+            await gate.release(0);
+            await waitSettled(page);
+            const rj = await snapshot(page);
+
+            check("J 拒绝：显示「全部拒绝」与具体原因（含非法日期 2023-02-29），无成功横幅",
+              rj.banners.some(x => x.cls.includes("bad") &&
+                x.text.includes("全部拒绝") && x.text.includes("2023-02-29")) &&
+              !rj.banners.some(x => x.cls.includes("ok")),
+              rj.banners);
+            check("J 拒绝：保留返回结果时的勾选（p1/p3）与字段操作、填写，不套用成功后清理",
+              rj.selCount === "2" &&
+              rj.rows.find(r => r.id === String(p1)).checked === true &&
+              rj.rows.find(r => r.id === String(p3)).checked === true &&
+              rj.fields.find(f => f.key === "source").op === "set" &&
+              rj.fields.find(f => f.key === "source").value === "拒绝等待期来源" &&
+              rj.fields.find(f => f.key === "important_date").op === "set" &&
+              rj.fields.find(f => f.key === "important_date").value === "2023-02-29",
+              {sel: rj.selCount, fields: rj.fields});
+            check("J 拒绝：按钮恢复「保存修改」，因仍有选中客户保持可提交",
+              rj.submitText === "保存修改" && !rj.submitDisabled,
+              {text: rj.submitText, disabled: rj.submitDisabled});
+            const unchanged = await listClients(pendBase);
+            check("J 拒绝：客户资料保持原样（p3、p1 都未被写入；等待期值未入库）",
+              unchanged.clients.find(x => x.id === p3).source === "线上广告" &&
+              unchanged.clients.find(x => x.id === p3).important_date === "2022-12-01" &&
+              unchanged.clients.find(x => x.id === p1).source === "等待期新来源" &&
+              JSON.stringify(unchanged.clients).includes("拒绝等待期来源") === false,
+              unchanged.clients);
+
+            // 等待结束后的提交门槛：取消全部勾选则不可提交，重新勾选才可提交
+            await uncheckRows(page, [p1, p3]);
+            const empty = await snapshot(page);
+            check("J 等待结束后：无勾选时按钮保持不可提交，也不自动补交",
+              empty.selCount === "0" && empty.submitDisabled &&
+              session.counts.batchPosts === beforePosts + 1,
+              {sel: empty.selCount, posts: session.counts.batchPosts});
+            await selectRows(page, [p3]);
+            // 用保留的填写修正日期后再次保存：应能正常发起一次「新」请求
+            await replaceFieldByTyping(page, "important_date", "2024-01-01");
+            await saveAndSettle(session);
+            const fixed = await snapshot(page);
+            check("J 修正后：新请求成功（累计第 2 次修改请求，处理 1 名）并完成清理",
+              successBanner(fixed, 1) && cleanedUp(fixed) &&
+              session.counts.batchPosts === beforePosts + 2,
+              {banners: fixed.banners, posts: session.counts.batchPosts});
+            const fixedData = await listClients(pendBase);
+            check("J 修正后：p3 按页面当前填写更新（来源与日期），证明等待期无自动补交、结束后可正常再保存",
+              fixedData.clients.find(x => x.id === p3).source === "拒绝等待期来源" &&
+              fixedData.clients.find(x => x.id === p3).important_date === "2024-01-01",
+              fixedData.clients.find(x => x.id === p3));
+            await page.close();
+          }
+
+          // ---------------------------------------------------------------
+          // 场景 K：等待结束时已无勾选——成功后按钮保持不可提交；
+          //         等待期勾过的第三名客户不在处理对象内
+          // ---------------------------------------------------------------
+          {
+            const session = await openSession(browser, pendBase);
+            const {page, gate} = session;
+            await selectRows(page, [p1]);
+            await chooseSet(page, "region", "K地区");
+            const beforePosts = session.counts.batchPosts;
+            gate.holdOn();
+            await page.click("#batch-submit");
+            await waitForHeld(gate, 1);
+            await waitSaving(page);
+
+            // 等待期：取消唯一勾选（全空），中途又勾选 p3 再取消——结束时无勾选
+            await uncheckRows(page, [p1]);
+            await dispatchFormSubmit(page);
+            await selectRows(page, [p3]);
+            await chooseSetAndType(page, "source", "不应提交给p3");
+            await uncheckRows(page, [p3]);
+            await dispatchFormSubmit(page);
+            const wk = await snapshot(page);
+            check("K 等待中：勾选清空后等待不解除、提示不被未选错误替换、请求仍仅 1 次",
+              wk.selCount === "0" && wk.submitText === "正在保存…" && wk.submitDisabled &&
+              busyBannerOnly(wk) &&
+              session.counts.batchPosts === beforePosts + 1 && gate.held.length === 1,
+              {count: wk.selCount, banners: wk.banners, posts: session.counts.batchPosts});
+            check("K 挂起请求体：处理对象只有首次提交的 p1",
+              payloadProblems(gate.held[0].payload, [p1], {
+                source: {op: "keep"},
+                region: {op: "set", value: "K地区"},
+                industry: {op: "keep"},
+                important_date: {op: "keep"},
+              }).length === 0,
+              gate.held[0].payload);
+
+            gate.holdOff();
+            await gate.release(0);
+            await waitSettled(page);
+            const rk = await snapshot(page);
+            check("K 放行后：按回复显示处理 1 名，字段清理；无勾选按钮保持不可提交",
+              successBanner(rk, 1) && rk.submitDisabled &&
+              rk.fields.every(f => f.op === "keep" && f.value === "" && f.disabled),
+              {banners: rk.banners, disabled: rk.submitDisabled, fields: rk.fields});
+            const kdata = await listClients(pendBase);
+            check("K 后端：仅 p1 地区更新；等待期勾过并填值的 p3 未被更新",
+              kdata.clients.find(x => x.id === p1).region === "K地区" &&
+              kdata.clients.find(x => x.id === p3).region === "华北" &&
+              JSON.stringify(kdata.clients).includes("不应提交给p3") === false,
+              kdata.clients);
+            await page.close();
+          }
+        } finally {
+          await stopApp({proc: pendProc});
+        }
       }
 
       // ===================================================================
