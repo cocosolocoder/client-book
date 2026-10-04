@@ -38,6 +38,7 @@ button:disabled{background:#9db6cc;border-color:#9db6cc;cursor:default}
 .banner{padding:.6rem 1rem;border-radius:6px;margin-bottom:.75rem}
 .banner.ok{background:#e9f7ec;border:1px solid #bfe3c8}
 .banner.bad{background:#fdeeee;border:1px solid #f3c4c4}
+.banner.warn{background:#fdf6e6;border:1px solid #ecd9a8}
 .banner.busy{background:#eef4fb;border:1px solid #c3d5e8}
 .failures{border:1px solid #ecd7d7;background:#fdf6f6;border-radius:6px;padding:.5rem 1rem;max-height:16rem;overflow:auto}
 .failures b{color:#a02b2b}
@@ -47,6 +48,8 @@ table{border-collapse:collapse;width:100%}
 #clients-table.on{display:table}
 #clients-empty{display:none}
 #clients-empty.on{display:block}
+#clients-load-error{display:none}
+#clients-load-error.on{display:block;color:#a06a16}
 th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid #e3e8ee;vertical-align:top}
 th{font-size:.85rem;color:#5b6b7b;font-weight:600}
 .muted{color:#9aa7b4}
@@ -86,6 +89,7 @@ th{font-size:.85rem;color:#5b6b7b;font-weight:600}
 
 <h2>客户列表</h2>
 <p id="clients-empty" class="muted">还没有客户记录。</p>
+<p id="clients-load-error" class="muted"></p>
 <table id="clients-table">
   <thead><tr><th style="width:2.2rem"><input type="checkbox" id="check-all" title="全选/取消全选当前列表"></th><th>编号</th><th>客户名称</th><th>来源</th><th>地区</th><th>行业</th><th>重要日期</th></tr></thead>
   <tbody id="clients-body"></tbody>
@@ -134,9 +138,34 @@ function syncSubmitState() {
 }
 
 async function loadClients() {
-  const res = await fetch("/api/clients");
-  const data = await res.json();
-  clients = data.clients || [];
+  // 只在明确读到有效客户列表（真正的空列表也算）时才更新页面；
+  // 连接错误、非成功状态、响应无法解析或未包含 clients 数组都视为读取失败：
+  // 保留此前已显示的客户编号、名称与各字段内容，不清空表格、不显示空列表提示。
+  const note = document.getElementById("clients-load-error");
+  let list;
+  try {
+    const res = await fetch("/api/clients");
+    if (!res.ok) throw new Error("服务返回非成功状态（HTTP " + res.status + "）");
+    const data = await res.json();
+    if (!data || !Array.isArray(data.clients)) {
+      throw new Error("响应未包含有效的客户列表");
+    }
+    list = data.clients;
+  } catch (err) {
+    let message = err.message;
+    if (err instanceof SyntaxError) message = "响应无法解析为有效数据";
+    if (err instanceof TypeError) message = "无法连接到服务（网络错误）";
+    note.textContent = "客户列表读取失败：" + message +
+      "，当前显示的资料可能不是最新内容；保存结果不受影响，稍后刷新页面即可重新读取。";
+    note.classList.add("on");
+    // 读取失败期间不能让表格或“还没有客户记录”冒充真实的空列表；
+    // 此前已渲染的行保留不动，之后真正读到空列表时再由 renderClients 恢复空状态提示。
+    document.getElementById("clients-empty").classList.remove("on");
+    throw new Error(message);
+  }
+  note.classList.remove("on");
+  note.textContent = "";
+  clients = list;
   const known = new Set(clients.map(r => r.id));
   for (const id of [...selected]) {
     if (!known.has(id)) selected.delete(id);
@@ -292,7 +321,16 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(payload),
     });
-    const data = await res.json();
+    // 响应无法读取或无法解析时，尚未收到服务明确的保存结论：不能当作保存成功，
+    // 也不使用“已保存、仅刷新失败”的说法，保留勾选与填写供用户确认后重新提交。
+    let data;
+    try {
+      data = await res.json();
+    } catch (parseErr) {
+      showBatchReport('<div class="banner bad">批量修改请求失败：保存结果无法读取' +
+        "（HTTP " + res.status + "），本次修改是否生效无法确认，请稍后核对列表后再决定是否重新提交。</div>");
+      return;
+    }
     if (!res.ok) {
       // 服务明确拒绝：显示具体原因，保留当时页面上的勾选、字段操作及填写内容，
       // 由用户修正后主动再次保存。
@@ -300,12 +338,37 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
         esc(data.error || "未知错误") + "</div>");
       return;
     }
+    // 服务明确返回成功：成功处理数量以保存回复为准，不按旧表格、当前勾选或刷新结果重算。
+    // 立即清除本次勾选并把字段编辑恢复为保持原值，随后的列表刷新成败都不改变这一结果。
     const count = data.updated_count;
+    if (typeof count !== "number" || !Number.isFinite(count)) {
+      // 没有明确的成功与处理数量，不能当作保存成功。
+      showBatchReport('<div class="banner bad">批量修改请求失败：服务未返回有效的处理数量，' +
+        "本次修改是否生效无法确认，请稍后核对列表后再决定是否重新提交。</div>");
+      return;
+    }
     resetBatchForm();
     selected.clear();
-    await loadClients();
-    showBatchReport('<div class="banner ok">已成功处理 <b>' + esc(count) +
-      "</b> 名客户，相关列已刷新，勾选已清除。</div>");
+    renderClients();
+    renderSelection();
+    let refreshed = true;
+    try {
+      await loadClients();
+    } catch (loadErr) {
+      refreshed = false;
+      // 刷新失败不自动重交刚才的修改，也不要求用户再次保存；旧表格（含勾选状态）
+      // 已按保存成功的结果保留/清除，不被读取失败清空。
+      showBatchReport(
+        '<div class="banner ok">已成功处理 <b>' + esc(count) +
+        "</b> 名客户，勾选已清除，字段编辑已恢复为保持原值。</div>" +
+        '<div class="banner warn">保存后读取客户列表失败（' + esc(loadErr.message) +
+        "）：列表暂未更新，当前显示的资料可能仍是保存前的内容；客户资料已按上述结果保存，" +
+        "稍后重新打开或刷新页面即可看到最新资料，无需再次保存。</div>");
+    }
+    if (refreshed) {
+      showBatchReport('<div class="banner ok">已成功处理 <b>' + esc(count) +
+        "</b> 名客户，列表已更新，勾选已清除，字段编辑已恢复为保持原值。</div>");
+    }
   } catch (err) {
     // 请求失败也要结束等待并显示失败，不能使页面一直无法继续使用。
     showBatchReport('<div class="banner bad">批量修改请求失败：' + esc(err.message) + "</div>");
@@ -343,7 +406,15 @@ document.getElementById("import-form").addEventListener("submit", async e => {
     const data = await res.json();
     renderReport(data, res.status);
     if (res.ok) {
-      await loadClients();
+      // 导入结果已明确后，列表读取失败只补充提示，不把已成功的导入改写成请求失败。
+      try {
+        await loadClients();
+      } catch (loadErr) {
+        showReport(
+          (document.getElementById("report").innerHTML) +
+          '<div class="banner warn">导入后读取客户列表失败（' + esc(loadErr.message) +
+          "）：列表暂未更新，当前显示的资料可能不是最新内容；导入结果以上述报告为准，稍后刷新页面即可。</div>");
+      }
     }
   } catch (err) {
     showReport('<div class="banner bad">导入请求失败：' + esc(err.message) + '</div>');
@@ -370,7 +441,9 @@ function renderReport(data, status) {
   showReport(out);
 }
 
-loadClients();
+// 首次读取失败时页内已显示读取失败提示且表格保持空白/原状，这里吞掉拒绝即可，
+// 不使用弹窗、不清空任何已有内容。
+loadClients().catch(() => {});
 </script>
 </body>
 </html>
