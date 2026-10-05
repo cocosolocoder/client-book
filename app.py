@@ -277,19 +277,21 @@ function showBatchReport(html) {
   document.getElementById("batch-report").innerHTML = html;
 }
 
-// 批量修改的可读错误说明：优先 {error:"..."}；只有回复不是 JSON 结构化数据时，
-// 才把纯文本原文当作说明。可解析但不含 error 文本的 JSON（如 {"unexpected":true}）
-// 不算可读说明，不向用户倾倒结构；空回复同样返回空串。
-function batchReadableError(data, raw) {
-  if (data && typeof data === "object" && !Array.isArray(data) &&
-      typeof data.error === "string" && data.error.trim()) {
-    return data.error;
+// 批量修改的可读错误说明：回复成功解析为 JSON 时，只取对象中的非空文本 error；
+// 只有回复不是 JSON 结构化数据时，才把纯文本原文当作说明。能解析成 JSON 却没有
+// 合格 error 的回复（如 {"unexpected":true}、null、[]、字符串形式的 JSON），
+// 或 error 只有空白、不是文本，都不算可读说明，不向用户倾倒结构；空回复同样
+// 返回空串。
+function batchReadableError(parsed, data, raw) {
+  if (parsed) {
+    if (data && typeof data === "object" && !Array.isArray(data) &&
+        typeof data.error === "string" && data.error.trim()) {
+      return data.error;
+    }
+    return "";
   }
-  if (data === null) {
-    const text = (raw || "").trim();
-    return text ? text.slice(0, 200) : "";
-  }
-  return "";
+  const text = (raw || "").trim();
+  return text ? text.slice(0, 200) : "";
 }
 
 // 没有取得可靠保存结论时的统一口径（非 400 错误、400 无可读原因、连接中断、
@@ -359,11 +361,16 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
       return;
     }
     let data = null;
+    // parsed 区分「回复确实解析成了 JSON」与「只是纯文本/空回复」：能解析成
+    // JSON 却没有合格 error 或有效数量时，不能把整个结构当作说明或成功依据。
+    let parsed = false;
     if (raw.trim()) {
       try {
         data = JSON.parse(raw);
+        parsed = true;
       } catch {
         data = null;
+        parsed = false;
       }
     }
 
@@ -371,7 +378,7 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
       // 约定：只有 HTTP 400 且带有明确可读的拒绝原因时，才表示整次修改被拒绝、
       // 所有客户资料保持原样，并展示原因供用户修正。空回复或无法解析的 400
       // （可能来自代理/网关）不能当成明确拒绝。
-      const reason = batchReadableError(data, raw);
+      const reason = batchReadableError(parsed, data, raw);
       if (reason) {
         showBatchReport('<div class="banner bad">本次修改已全部拒绝，客户资料保持原样。<br>原因：' +
           esc(reason) + "</div>");
@@ -385,7 +392,7 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
     if (!res.ok) {
       // 其他非成功状态（如 HTTP 500/502）：即使带有可解析的错误说明，也不能断言
       // 资料保持原样或已经回滚——客户资料可能已经被修改。保留已知状态码与可读说明。
-      const detail = batchReadableError(data, raw);
+      const detail = batchReadableError(parsed, data, raw);
       const prefix = detail
         ? "保存未成功（HTTP " + res.status + "）：" + esc(detail) + "。<br>"
         : "保存未成功（HTTP " + res.status + "），服务没有给出可展示的错误说明：";
@@ -394,14 +401,16 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
     }
 
     // 服务明确返回成功：成功处理数量以保存回复为准，不按旧表格、当前勾选或刷新结果重算。
-    // 立即清除本次勾选并把字段编辑恢复为保持原值，随后的列表刷新成败都不改变这一结果。
-    const count = data && typeof data === "object" && !Array.isArray(data)
-      ? data.updated_count
-      : undefined;
-    if (typeof count !== "number" || !Number.isFinite(count)) {
-      // 成功状态但回复无法解析或缺少有效处理数量：仍不知道修改是否生效，
-      // 不显示成功数量、不做保存成功后的清理，按无法确认处理。
-      const problem = data === null ? "回复内容无法解析" : "回复中没有有效的处理数量";
+    // 只有回复是 JSON 对象、且 updated_count 是非负整数数字时才能确认成功（0 也算）；
+    // 负数、小数、数字形式的文本、布尔、null 或字段缺失都不是有效处理数量——不转成
+    // 数字、不取整、不补零；空回复、无法解析或回复不是对象同样无法确认。
+    const okData = parsed && data && typeof data === "object" && !Array.isArray(data);
+    const count = okData ? data.updated_count : undefined;
+    if (!isNonNegativeInt(count)) {
+      // 成功状态却拿不到有效处理数量：仍不知道修改是否生效，不显示成功数量、
+      // 不做保存成功后的清理（保留结果处理时页面上的勾选、字段操作与已填内容、
+      // 旧表格，不触发保存后的列表读取，不自动再次发送修改），按无法确认处理。
+      const problem = parsed ? "回复中没有有效的处理数量" : "回复内容无法解析";
       showBatchReport(unconfirmedBatchHtml("保存请求已返回成功状态，但" + problem + "："));
       return;
     }
