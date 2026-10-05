@@ -533,6 +533,136 @@ def main():
                s == 400 and "YYYY-MM-DD" in d["error"], d)
         expect("日期格式错误同样整次不写入",
                req("GET", "/api/clients")[1] == bad_date_snapshot)
+
+        # ===== 拒绝回归：不能修改的字段与非文本设置值 =====
+        # 只要修改说明中出现一个不合法项（name/id/不存在的字段，或 set 值不是文本），
+        # 整次修改就必须被拒绝：HTTP 400、error 为非空文本且指出具体字段或原因、
+        # 不含 updated_count，随后读到的客户资料与提交前完全一致。
+        # 28. 准备四名客户：三名将被选中（资料互不相同，丙的来源与行业原本未填写），
+        #     一名不被选中作对照。
+        s, d = import_csv(
+            "name,source,region,industry,important_date\n"
+            "拒甲,官网,华东,制造业,2020-02-29\n"
+            "拒乙,展会,华南,零售业,2021-07-15\n"
+            "拒丙,,华北,,2022-08-08\n"
+            "拒丁,广告,西南,互联网,2023-09-09\n"
+        )
+        expect("拒绝回归客户导入 4 新增", s == 200 and d["imported_count"] == 4, d)
+        id_p, id_q, id_r, id_s = (x["id"] for x in d["imported"])
+        before_p = client_by_id(id_p)
+        before_q = client_by_id(id_q)
+        before_r = client_by_id(id_r)
+        before_s = client_by_id(id_s)
+        expect("拒绝回归客户资料互不相同",
+               before_p["source"] != before_q["source"]
+               and before_p["important_date"] != before_q["important_date"],
+               (before_p, before_q))
+        expect("拒丙来源与行业原本未填写",
+               before_r["source"] is None and before_r["industry"] is None, before_r)
+        reject_snapshot = req("GET", "/api/clients")[1]
+
+        def expect_reject(label, ids, updates, *must_in_error):
+            s, d = batch_update(ids, updates)
+            expect(label + "：400、error 为非空文本、无 updated_count",
+                   s == 400 and isinstance(d, dict)
+                   and isinstance(d.get("error"), str) and d["error"].strip()
+                   and "updated_count" not in d, (s, d))
+            for frag in must_in_error:
+                expect(label + "：原因指出「%s」" % frag,
+                       isinstance(d.get("error"), str) and frag in d["error"], d)
+            expect(label + "：拒绝结论与随后读到的资料一致（整次不生效）",
+                   req("GET", "/api/clients")[1] == reject_snapshot)
+
+        # 29. updates 中出现 name、id 或不存在的字段：即使同次包含合法的来源设置或
+        #     行业清空，也整次拒绝，原因指出哪个字段不能修改；合法项排在不合法项
+        #     前面或后面结果相同，选中客户的合法字段不能先保存。
+        expect_reject("name 搭配合法来源设置（不合法项在后）", [id_p, id_q, id_r],
+                      {"source": {"op": "set", "value": "不应写入的来源"},
+                       "name": {"op": "set", "value": "不应改名"}},
+                      "name")
+        expect_reject("id 搭配合法行业清空（不合法项在前）", [id_p, id_q, id_r],
+                      {"id": {"op": "set", "value": 1},
+                       "industry": {"op": "clear"}},
+                      "id")
+        expect_reject("不存在的字段搭配合法修改", [id_p, id_q, id_r],
+                      {"source": {"op": "set", "value": "不应写入的来源"},
+                       "industry": {"op": "clear"},
+                       "no_such_field": {"op": "set", "value": "x"}},
+                      "no_such_field")
+        # 不能修改的字段即使选择 keep（看似不产生变化）也须整次拒绝，不能默默忽略。
+        expect_reject("name 即使 keep 也拒绝", [id_p, id_q],
+                      {"name": {"op": "keep"},
+                       "region": {"op": "set", "value": "不应写入的地区"}},
+                      "name")
+        expect_reject("id 即使 keep 也拒绝", [id_p, id_q],
+                      {"id": {"op": "keep"},
+                       "source": {"op": "set", "value": "不应写入的来源"}},
+                      "id")
+        expect_reject("不存在的字段即使 keep 也拒绝", [id_p, id_q],
+                      {"no_such_field": {"op": "keep"},
+                       "industry": {"op": "clear"}},
+                      "no_such_field")
+
+        # 30. 四个可修改字段最终操作为 set 时，value 必须是文本：数字、布尔、null、
+        #     数组、对象以及缺少 value 均返回 400，原因指出设置值不是文本，不把这些
+        #     值转成文字写入；同次请求的其他合法设置或清空也一并拒绝。
+        nontext_cases = [
+            ("数字", "source", {"op": "set", "value": 123}, "来源"),
+            ("布尔", "region", {"op": "set", "value": True}, "地区"),
+            ("null", "industry", {"op": "set", "value": None}, "行业"),
+            ("数组", "important_date", {"op": "set", "value": ["2024-01-01"]}, "重要日期"),
+            ("对象", "source", {"op": "set", "value": {"x": 1}}, "来源"),
+            ("缺少 value", "important_date", {"op": "set"}, "重要日期"),
+        ]
+        for label, field, bad_spec, field_label in nontext_cases:
+            updates = {"region": {"op": "set", "value": "不应写入的地区"},
+                       "industry": {"op": "clear"}}
+            updates[field] = bad_spec
+            expect_reject("非文本设置值-" + label, [id_p, id_q, id_r], updates,
+                          field_label, "不是文本")
+
+        # 31. 全部拒绝之后逐名核对：选中客户的编号、名称与四个可修改字段分别保持
+        #     原值，原本为空的仍为空；未选中的拒丁不受影响，客户数量不变。
+        final_list = req("GET", "/api/clients")[1]
+        expect("拒绝后客户数量不变",
+               len(final_list["clients"]) == len(reject_snapshot["clients"]),
+               (len(final_list["clients"]), len(reject_snapshot["clients"])))
+        expect("拒甲各字段保持原值", client_by_id(id_p) == before_p, client_by_id(id_p))
+        expect("拒乙各字段保持原值", client_by_id(id_q) == before_q, client_by_id(id_q))
+        expect("拒丙各字段保持原值且空字段仍为空",
+               client_by_id(id_r) == before_r
+               and client_by_id(id_r)["source"] is None
+               and client_by_id(id_r)["industry"] is None, client_by_id(id_r))
+        expect("未选中的拒丁不受影响", client_by_id(id_s) == before_s, client_by_id(id_s))
+
+        # 32. 用户只修正那个不合法修改项后，再提交同样的合法修改：仍按现有规则
+        #     成功——只改变选中客户明确设置或清空的字段，省略的字段各自保留，
+        #     返回实际处理的客户数量。
+        s, d = batch_update([id_p, id_q, id_r], {
+            "source": {"op": "set", "value": "  修正后来源  "},
+            "industry": {"op": "clear"},
+        })
+        expect("修正后重提 200 且返回实际处理数量",
+               s == 200 and d == {"updated_count": 3}, (s, d))
+        p_now, q_now, r_now, s_now = (client_by_id(x) for x in (id_p, id_q, id_r, id_s))
+        expect("重提后来源为设置值（去前后空白）",
+               p_now["source"] == "修正后来源" and q_now["source"] == "修正后来源"
+               and r_now["source"] == "修正后来源", (p_now, q_now, r_now))
+        expect("重提后行业清空为 null",
+               p_now["industry"] is None and q_now["industry"] is None
+               and r_now["industry"] is None, (p_now, q_now, r_now))
+        expect("省略的字段各自保留",
+               p_now["region"] == "华东" and q_now["region"] == "华南"
+               and r_now["region"] == "华北"
+               and p_now["important_date"] == "2020-02-29"
+               and q_now["important_date"] == "2021-07-15"
+               and r_now["important_date"] == "2022-08-08", (p_now, q_now, r_now))
+        expect("重提后编号与名称不变",
+               p_now["id"] == id_p and p_now["name"] == "拒甲"
+               and q_now["id"] == id_q and q_now["name"] == "拒乙"
+               and r_now["id"] == id_r and r_now["name"] == "拒丙",
+               (p_now, q_now, r_now))
+        expect("重提后未选中的拒丁仍不变", s_now == before_s, s_now)
     finally:
         proc.terminate()
         proc.wait(timeout=5)
