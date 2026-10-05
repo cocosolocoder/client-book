@@ -251,6 +251,14 @@ async function chooseClear(page, key) {
   }, key);
 }
 
+// 切回「保持原值」：注意页面不会清空输入框，已填文字会作为「残留文字」留在已
+// 禁用的输入框里——保存时必须以最后选定的 keep 为准，不能写入或清空残留内容。
+async function chooseKeep(page, key) {
+  await page.evaluate(key => {
+    document.querySelector(`#batch-fields .bf[data-field="${key}"] input[value=keep]`).click();
+  }, key);
+}
+
 async function saveAndSettle(session) {
   const {page, counts} = session;
   const before = counts.batchPosts;
@@ -1297,6 +1305,379 @@ async function run() {
           }
         } finally {
           await stopApp({proc: pProc});
+        }
+      }
+
+      // ===================================================================
+      // 场景 L：保存以每个字段「最后选定的操作」为准——回归覆盖用户填过内容后
+      //         重新选择字段，以及明确选择设置却只留下空白的过程：
+      //   L1 先「设为填写的值」并输入文字/无效日期，再改回「保持原值」，转改另一
+      //      字段后保存：前者每名客户各自保留原值，残留文字既不写入也不因输入框
+      //      禁用而清空，残留的无效日期不校验、不妨碍其他有效修改；
+      //   L2 最终选择「清空」：之前留下的文字或无效日期一律忽略，保存后未填写；
+      //   L3 最终「设为填写的值」但只填空白（空格/制表/换行）：四个字段都按清空
+      //      处理，重要日期仅空格也清空、不报日期格式错误；列表显示未填写、接口
+      //      返回 null；
+      //   L4 非空文本只去前后空白，内部空白与换行保留；客户名称、编号与未选中客户
+      //      始终不变；
+      //   L5 选中客户中某字段原本为空时不被其他客户补入内容；
+      //   L6 四个字段最终全部保持原值（即使输入框留有文字）也拒绝保存并说明没有
+      //      修改项，不显示成功数量，保留勾选、操作与残留填写；
+      //   L7 重要日期最终选择设置且填写无效日期：整次修改拒绝、其他字段不先保存，
+      //      保留勾选/操作/填写供修正；修正后按实际选中数显示成功、更新列、清除
+      //      勾选、四字段恢复保持原值、输入清空并禁用。
+      // ===================================================================
+      {
+        const {proc: lProc, port: lPortP} = startApp("final-op");
+        try {
+          const lBase = `http://127.0.0.1:${await lPortP}`;
+          await waitReady(lBase);
+          const [l1, l2, l3] = await seed(lBase, [
+            // 三名客户资料互不相同；丙的行业导入时即为空
+            {name: "回归甲", source: "甲网", region: "甲地区", industry: "甲行业", date: "2020-03-03"},
+            {name: "回归乙", source: "乙网", region: "乙地区", industry: "乙行业", date: "2021-04-04"},
+            {name: "回归丙", source: "丙网", region: "丙地区", industry: "", date: "2022-05-05"},
+          ]);
+          const byIdL = async id =>
+            (await listClients(lBase)).clients.find(x => x.id === id);
+
+          const session = await openSession(browser, lBase);
+          const {page, counts} = session;
+
+          // -----------------------------------------------------------------
+          // L1：set 填过文字/无效日期后改 keep——以最后选择的 keep 为准
+          // -----------------------------------------------------------------
+          await selectRows(page, [l1, l2]);
+          await chooseSet(page, "source", "残留来源文字");
+          await chooseSet(page, "important_date", "2023-02-29"); // 非闰年无效日期
+          await chooseKeep(page, "source");
+          await chooseKeep(page, "important_date");
+          await chooseSet(page, "region", "  共同地区  ");
+
+          const kept = await snapshot(page);
+          check("L1 改回保持：来源/日期单选为 keep，输入框已不可填写但残留文字仍在",
+            kept.fields.find(f => f.key === "source").op === "keep" &&
+            kept.fields.find(f => f.key === "source").disabled &&
+            kept.fields.find(f => f.key === "source").value === "残留来源文字" &&
+            kept.fields.find(f => f.key === "important_date").op === "keep" &&
+            kept.fields.find(f => f.key === "important_date").disabled &&
+            kept.fields.find(f => f.key === "important_date").value === "2023-02-29",
+            kept.fields);
+          check("L1 改回保持：地区为最终设置且可填写，行业仍为保持原值",
+            kept.fields.find(f => f.key === "region").op === "set" &&
+            !kept.fields.find(f => f.key === "region").disabled &&
+            kept.fields.find(f => f.key === "industry").op === "keep",
+            kept.fields);
+
+          // 页面发出的请求也只体现最终选择：keep 不带残留文本，set 才带值
+          const payloadL1 = await page.evaluate(() => structuredClone(collectBatchPayload()));
+          check("L1 请求内容：来源/日期/行业均为 keep（不携带残留文字），地区为 set",
+            JSON.stringify(payloadL1.ids) === JSON.stringify([l1, l2]) &&
+            payloadL1.updates.source.op === "keep" &&
+            !("value" in payloadL1.updates.source) &&
+            payloadL1.updates.important_date.op === "keep" &&
+            payloadL1.updates.industry.op === "keep" &&
+            payloadL1.updates.region.op === "set" &&
+            payloadL1.updates.region.value === "  共同地区  ",
+            payloadL1);
+
+          const beforePostsL1 = counts.batchPosts;
+          await saveAndSettle(session);
+          const sL1 = await snapshot(page);
+          check("L1 保存：按选中 2 名显示成功并完成清理（残留无效日期没有触发拒绝）",
+            successBanner(sL1, 2) && cleanedUp(sL1),
+            {banners: sL1.banners, sel: sL1.selCount, fields: sL1.fields});
+          check("L1 列表：甲乙来源仍是各自原值（不是同一段残留文字），日期各自保留",
+            sL1.rows.find(r => r.id === String(l1)).cells[1] === "甲网" &&
+            sL1.rows.find(r => r.id === String(l2)).cells[1] === "乙网" &&
+            sL1.rows.find(r => r.id === String(l1)).cells[4] === "2020-03-03" &&
+            sL1.rows.find(r => r.id === String(l2)).cells[4] === "2021-04-04",
+            sL1.rows);
+          check("L1 列表：行业未因输入框禁用被清空；地区按最后选择的 set 更新（去前后空白）",
+            sL1.rows.find(r => r.id === String(l1)).cells[3] === "甲行业" &&
+            sL1.rows.find(r => r.id === String(l2)).cells[3] === "乙行业" &&
+            sL1.rows.find(r => r.id === String(l1)).cells[2] === "共同地区" &&
+            sL1.rows.find(r => r.id === String(l2)).cells[2] === "共同地区",
+            sL1.rows);
+          check("L1 列表：未选中的丙整行不变（含原本为空的行业显示未填写）",
+            JSON.stringify(sL1.rows.find(r => r.id === String(l3)).cells) ===
+            JSON.stringify(["回归丙", "丙网", "丙地区", "—", "2022-05-05"]),
+            sL1.rows.find(r => r.id === String(l3)).cells);
+          check("L1 保存请求仅 1 次",
+            counts.batchPosts === beforePostsL1 + 1, counts.batchPosts);
+          const bL1 = await Promise.all([byIdL(l1), byIdL(l2), byIdL(l3)]);
+          check("L1 接口：甲乙保留各自原值、地区落库为共同地区，丙完全不变",
+            bL1[0].source === "甲网" && bL1[0].important_date === "2020-03-03" &&
+            bL1[0].region === "共同地区" && bL1[0].industry === "甲行业" &&
+            bL1[1].source === "乙网" && bL1[1].important_date === "2021-04-04" &&
+            bL1[1].region === "共同地区" &&
+            bL1[2].source === "丙网" && bL1[2].region === "丙地区" &&
+            bL1[2].industry === null && bL1[2].important_date === "2022-05-05",
+            bL1);
+
+          // -----------------------------------------------------------------
+          // L2：最终选择清空——残留文字/无效日期一律忽略，保存后未填写
+          // -----------------------------------------------------------------
+          await selectRows(page, [l1, l2]);
+          await chooseSet(page, "source", "又一段文字");
+          await chooseSet(page, "important_date", "2023-02-29");
+          await chooseClear(page, "source");
+          await chooseClear(page, "important_date");
+          const cleared0 = await snapshot(page);
+          check("L2 保存前：最终选择清空，输入框禁用但残留文字/无效日期仍在",
+            cleared0.fields.find(f => f.key === "source").op === "clear" &&
+            cleared0.fields.find(f => f.key === "source").disabled &&
+            cleared0.fields.find(f => f.key === "source").value === "又一段文字" &&
+            cleared0.fields.find(f => f.key === "important_date").op === "clear" &&
+            cleared0.fields.find(f => f.key === "important_date").value === "2023-02-29",
+            cleared0.fields);
+          const payloadL2 = await page.evaluate(() => structuredClone(collectBatchPayload()));
+          check("L2 请求内容：来源/日期均为 clear（不携带残留内容）",
+            payloadL2.updates.source.op === "clear" &&
+            !("value" in payloadL2.updates.source) &&
+            payloadL2.updates.important_date.op === "clear",
+            payloadL2);
+
+          await saveAndSettle(session);
+          const sL2 = await snapshot(page);
+          check("L2 保存：显示成功 2 名并完成清理（残留无效日期不再校验）",
+            successBanner(sL2, 2) && cleanedUp(sL2), {banners: sL2.banners});
+          check("L2 列表：甲乙来源与重要日期均显示未填写，其余列不变",
+            sL2.rows.find(r => r.id === String(l1)).cells[1] === "—" &&
+            sL2.rows.find(r => r.id === String(l1)).cells[4] === "—" &&
+            sL2.rows.find(r => r.id === String(l2)).cells[1] === "—" &&
+            sL2.rows.find(r => r.id === String(l2)).cells[4] === "—" &&
+            sL2.rows.find(r => r.id === String(l1)).cells[3] === "甲行业",
+            sL2.rows);
+          const bL2 = await Promise.all([byIdL(l1), byIdL(l2)]);
+          check("L2 接口：来源与日期为 null（不是残留文字或残留日期）",
+            bL2[0].source === null && bL2[0].important_date === null &&
+            bL2[1].source === null && bL2[1].important_date === null,
+            bL2);
+
+          // -----------------------------------------------------------------
+          // L3：最终 set 却只填空白——四字段都按清空，日期空格不报格式错误
+          // -----------------------------------------------------------------
+          // 先把甲的四个字段写成非空值，再验证纯空白填写会让它们成为未填写
+          await selectRows(page, [l1]);
+          await chooseSet(page, "source", "临时来源");
+          await chooseSet(page, "region", "临时地区");
+          await chooseSet(page, "industry", "临时行业");
+          await chooseSet(page, "important_date", "2025-06-06");
+          await saveAndSettle(session);
+
+          await selectRows(page, [l1]);
+          await chooseSet(page, "source", "   ");        // 仅空格
+          await chooseSet(page, "region", "\t");         // 仅制表符
+          await chooseSet(page, "industry", "\n");       // 仅换行
+          await chooseSet(page, "important_date", "  \n\t "); // 日期仅空白
+          const beforePostsL3 = counts.batchPosts;
+          const listGetsL3 = counts.listGets;
+          await saveAndSettle(session);
+          const sL3 = await snapshot(page);
+          check("L3 纯空白 set：按成功 1 名处理（不是日期格式错误的拒绝）并完成清理",
+            successBanner(sL3, 1) && cleanedUp(sL3) &&
+            !sL3.banners.some(x => x.cls.includes("bad")),
+            sL3.banners);
+          check("L3 列表：四个字段都显示未填写",
+            JSON.stringify(sL3.rows.find(r => r.id === String(l1)).cells) ===
+            JSON.stringify(["回归甲", "—", "—", "—", "—"]),
+            sL3.rows.find(r => r.id === String(l1)).cells);
+          check("L3 成功后正常触发一次列表刷新、保存请求仅 1 次",
+            counts.listGets === listGetsL3 + 1 &&
+            counts.batchPosts === beforePostsL3 + 1,
+            {list: counts.listGets, posts: counts.batchPosts});
+          const bL3 = await byIdL(l1);
+          check("L3 接口：空串/空格/制表/换行填写后四个字段均为 null",
+            bL3.source === null && bL3.region === null &&
+            bL3.industry === null && bL3.important_date === null,
+            bL3);
+
+          // -----------------------------------------------------------------
+          // L4：非空文本只去前后空白，内部空白与换行保留；名称/编号/未选中客户不变
+          // -----------------------------------------------------------------
+          await selectRows(page, [l2]);
+          await chooseSet(page, "source", "  来 源\tA  ");
+          await chooseSet(page, "industry", "行 业\n第二行\t保留");
+          await saveAndSettle(session);
+          const sL4 = await snapshot(page);
+          check("L4 非空 set：成功 1 名并清理",
+            successBanner(sL4, 1) && cleanedUp(sL4), sL4.banners);
+          check("L4 列表：仅去除前后空白，内部空格/制表/换行原样保留",
+            sL4.rows.find(r => r.id === String(l2)).cells[1] === "来 源\tA" &&
+            sL4.rows.find(r => r.id === String(l2)).cells[3] === "行 业\n第二行\t保留",
+            sL4.rows.find(r => r.id === String(l2)).cells);
+          const [bL42, bL43] = await Promise.all([byIdL(l2), byIdL(l3)]);
+          check("L4 接口：内部空白保留；客户名称与编号不变；未选中的丙资料不变",
+            bL42.id === l2 && bL42.name === "回归乙" &&
+            bL42.source === "来 源\tA" &&
+            bL42.industry === "行 业\n第二行\t保留" &&
+            bL43.id === l3 && bL43.name === "回归丙" &&
+            bL43.source === "丙网" && bL43.region === "丙地区" &&
+            bL43.industry === null && bL43.important_date === "2022-05-05",
+            [bL42, bL43]);
+
+          // -----------------------------------------------------------------
+          // L5：选中客户中某字段原本为空——不被其他客户补入内容
+          // -----------------------------------------------------------------
+          await selectRows(page, [l2, l3]);
+          await chooseSet(page, "source", "批量来源");
+          // 行业保持原值：乙有内部空白的内容，丙原本为空
+          await saveAndSettle(session);
+          const sL5 = await snapshot(page);
+          check("L5 含空值客户：成功 2 名并清理",
+            successBanner(sL5, 2) && cleanedUp(sL5), sL5.banners);
+          check("L5 列表：来源同为设置值；乙行业保留、丙行业仍为未填写（未互相补值）",
+            sL5.rows.find(r => r.id === String(l2)).cells[1] === "批量来源" &&
+            sL5.rows.find(r => r.id === String(l3)).cells[1] === "批量来源" &&
+            sL5.rows.find(r => r.id === String(l2)).cells[3] === "行 业\n第二行\t保留" &&
+            sL5.rows.find(r => r.id === String(l3)).cells[3] === "—",
+            sL5.rows);
+          const bL5 = await byIdL(l3);
+          check("L5 接口：丙行业仍为 null，未从乙补入内容",
+            bL5.industry === null && bL5.source === "批量来源", bL5);
+          await page.close();
+
+          // -----------------------------------------------------------------
+          // L6：四字段最终全部 keep（输入框留有文字）——拒绝并说明没有修改项
+          // -----------------------------------------------------------------
+          {
+            const s6 = await openSession(browser, lBase);
+            const p6 = s6.page;
+            await selectRows(p6, [l1, l2, l3]);
+            await chooseSet(p6, "source", "不应提交的残留");
+            await chooseSet(p6, "region", "x");
+            await chooseSet(p6, "industry", "y");
+            await chooseSet(p6, "important_date", "2023-02-29");
+            await chooseKeep(p6, "source");
+            await chooseKeep(p6, "region");
+            await chooseKeep(p6, "industry");
+            await chooseKeep(p6, "important_date");
+
+            const before6 = await snapshot(p6);
+            check("L6 保存前：四字段均为 keep，输入框禁用但各自残留文字仍在",
+              before6.fields.every(f => f.op === "keep" && f.disabled && f.value !== "") &&
+              before6.fields.find(f => f.key === "important_date").value === "2023-02-29",
+              before6.fields);
+            const payload6 = await p6.evaluate(() => structuredClone(collectBatchPayload()));
+            check("L6 请求内容：四个字段全部是 keep",
+              ["source", "region", "industry", "important_date"].every(
+                k => payload6.updates[k].op === "keep"),
+              payload6);
+
+            const backendBefore = JSON.stringify((await listClients(lBase)).clients);
+            const posts6 = s6.counts.batchPosts;
+            await saveAndSettle(s6);
+            const rej6 = await snapshot(p6);
+            check("L6 拒绝：显示全部拒绝并说明全部保持原值、没有可保存的修改项",
+              rej6.banners.some(b => b.cls.includes("bad") &&
+                b.text.includes("全部拒绝") &&
+                b.text.includes("保持原值") &&
+                /设置|清空/.test(b.text)),
+              rej6.banners);
+            check("L6 拒绝：不显示成功数量，也没有成功/警告横幅",
+              !/已成功处理/.test(rej6.reportText) &&
+              !rej6.banners.some(b => b.cls.includes("ok") || b.cls.includes("warn")),
+              rej6.reportText);
+            check("L6 拒绝：三名勾选保留、全选框选中，按钮恢复且可提交",
+              rej6.selCount === "3" && rej6.checkAllChecked &&
+              [l1, l2, l3].every(id => rej6.rows.find(r => r.id === String(id))?.checked) &&
+              rej6.submitText === "保存修改" && !rej6.submitDisabled,
+              {sel: rej6.selCount, rows: rej6.rows.map(r => [r.id, r.checked])});
+            check("L6 拒绝：四字段仍为 keep，残留填写原样保留在禁用输入框中供修正",
+              rej6.fields.find(f => f.key === "source").op === "keep" &&
+              rej6.fields.find(f => f.key === "source").value === "不应提交的残留" &&
+              rej6.fields.find(f => f.key === "source").disabled &&
+              rej6.fields.find(f => f.key === "important_date").value === "2023-02-29",
+              rej6.fields);
+            check("L6 拒绝：仅 1 次请求、未触发保存后列表刷新",
+              s6.counts.batchPosts === posts6 + 1 && s6.counts.listGets === 1,
+              {posts: s6.counts.batchPosts, list: s6.counts.listGets});
+            check("L6 拒绝：后端资料完全不变",
+              JSON.stringify((await listClients(lBase)).clients) === backendBefore);
+            await p6.close();
+          }
+
+          // -----------------------------------------------------------------
+          // L7：日期最终 set 且无效——整次拒绝、其他字段不先保存；修正后成功
+          // -----------------------------------------------------------------
+          {
+            const s7 = await openSession(browser, lBase);
+            const p7 = s7.page;
+            await selectRows(p7, [l2, l3]);
+            await chooseSet(p7, "source", "不应部分写入的来源");
+            await chooseClear(p7, "industry");
+            await chooseSet(p7, "important_date", "2023-02-29");
+
+            const backendBefore7 = JSON.stringify((await listClients(lBase)).clients);
+            const posts7 = s7.counts.batchPosts;
+            await saveAndSettle(s7);
+            const rej7 = await snapshot(p7);
+            check("L7 拒绝：显示全部拒绝与具体非法日期原因",
+              rej7.banners.some(b => b.cls.includes("bad") &&
+                b.text.includes("全部拒绝") && b.text.includes("2023-02-29")),
+              rej7.banners);
+            check("L7 拒绝：无成功/警告横幅、不显示成功数量",
+              !rej7.banners.some(b => b.cls.includes("ok") || b.cls.includes("warn")) &&
+              !/已成功处理/.test(rej7.reportText), rej7.banners);
+            check("L7 拒绝：乙丙勾选保留（甲未勾选）、按钮恢复可提交",
+              rej7.selCount === "2" &&
+              rej7.rows.find(r => r.id === String(l2)).checked &&
+              rej7.rows.find(r => r.id === String(l3)).checked &&
+              !rej7.rows.find(r => r.id === String(l1)).checked &&
+              !rej7.submitDisabled,
+              {sel: rej7.selCount, rows: rej7.rows.map(r => [r.id, r.checked])});
+            check("L7 拒绝：字段操作与填写保留（来源 set 文本可填、行业 clear、日期 set 非法值可填）",
+              rej7.fields.find(f => f.key === "source").op === "set" &&
+              rej7.fields.find(f => f.key === "source").value === "不应部分写入的来源" &&
+              !rej7.fields.find(f => f.key === "source").disabled &&
+              rej7.fields.find(f => f.key === "industry").op === "clear" &&
+              rej7.fields.find(f => f.key === "important_date").op === "set" &&
+              rej7.fields.find(f => f.key === "important_date").value === "2023-02-29" &&
+              !rej7.fields.find(f => f.key === "important_date").disabled,
+              rej7.fields);
+            check("L7 拒绝：其他字段没有先保存（来源未写入、行业未清空），后端整体不变",
+              JSON.stringify((await listClients(lBase)).clients) === backendBefore7);
+            check("L7 拒绝：仅 1 次请求、未触发保存后列表刷新，表格仍是旧资料",
+              s7.counts.batchPosts === posts7 + 1 && s7.counts.listGets === 1 &&
+              rej7.rows.find(r => r.id === String(l2)).cells[1] === "批量来源" &&
+              rej7.rows.find(r => r.id === String(l2)).cells[3] === "行 业\n第二行\t保留",
+              {posts: s7.counts.batchPosts, list: s7.counts.listGets});
+
+            // 直接在保留的勾选与填写上把日期修正为有效日期后再次保存
+            await p7.evaluate(() => {
+              document.querySelector('#batch-fields .bf[data-field="important_date"] .bf-value')
+                .value = "2024-02-29";
+            });
+            await saveAndSettle(s7);
+            const ok7 = await snapshot(p7);
+            check("L7 修正后：按实际选中 2 名显示成功（列表已更新）并完成清理",
+              ok7.banners.some(b => b.cls.includes("ok") &&
+                /已成功处理\s*2\s*名客户/.test(b.text) && b.text.includes("列表已更新")) &&
+              cleanedUp(ok7), {banners: ok7.banners, sel: ok7.selCount, fields: ok7.fields});
+            check("L7 修正后：列表列更新——乙丙来源写入、行业未填写、日期为 2024-02-29；甲不变",
+              ok7.rows.find(r => r.id === String(l2)).cells[1] === "不应部分写入的来源" &&
+              ok7.rows.find(r => r.id === String(l2)).cells[3] === "—" &&
+              ok7.rows.find(r => r.id === String(l2)).cells[4] === "2024-02-29" &&
+              ok7.rows.find(r => r.id === String(l3)).cells[1] === "不应部分写入的来源" &&
+              ok7.rows.find(r => r.id === String(l3)).cells[3] === "—" &&
+              ok7.rows.find(r => r.id === String(l3)).cells[4] === "2024-02-29" &&
+              JSON.stringify(ok7.rows.find(r => r.id === String(l1)).cells) ===
+              JSON.stringify(["回归甲", "—", "—", "—", "—"]),
+              ok7.rows);
+            const [f1, f2, f3] = await Promise.all([byIdL(l1), byIdL(l2), byIdL(l3)]);
+            check("L7 修正后接口：乙丙按最后操作落库，甲与全部客户名称/编号不变",
+              f2.source === "不应部分写入的来源" && f2.industry === null &&
+              f2.important_date === "2024-02-29" && f2.region === "共同地区" &&
+              f3.source === "不应部分写入的来源" && f3.industry === null &&
+              f3.important_date === "2024-02-29" && f3.region === "丙地区" &&
+              f1.source === null && f1.region === null &&
+              f1.name === "回归甲" && f2.name === "回归乙" && f3.name === "回归丙",
+              [f1, f2, f3]);
+            await p7.close();
+          }
+        } finally {
+          await stopApp({proc: lProc});
         }
       }
 

@@ -381,6 +381,158 @@ def main():
         expect("不存在编号原因具体", str(ghost) in d["error"], d)
         expect("不存在编号整次不生效", req("GET", "/api/clients")[1] == snapshot)
         expect("拒绝后未选中客户仍不变", client_by_id(id_c) == before_c, client_by_id(id_c))
+
+        # ===== 字段「最终操作选择」回归 =====
+        # 保存时只以各字段最后选定的 keep/set/clear 为准；输入残留、禁用状态或留空
+        # 都不能自行替代这个选择。
+        # 19. 准备三名资料互不相同的客户，其中丙的行业导入时即为空（用于验证空值
+        #     不会从其他选中客户补入内容）
+        s, d = import_csv(
+            "name,source,region,industry,important_date\n"
+            "选甲,s1,r1,i1,2020-03-03\n"
+            "选乙,s2,r2,i2,2021-04-04\n"
+            "选丙,s3,r3,,2022-05-05\n"
+        )
+        expect("最终操作回归客户导入 3 新增", s == 200 and d["imported_count"] == 3, d)
+        id_x, id_y, id_z = (x["id"] for x in d["imported"])
+        expect("选丙行业初始为空", client_by_id(id_z)["industry"] is None, client_by_id(id_z))
+
+        # 20. 先「设为填写的值」再改成「保持原值」：最终 keep 时修改说明里残留的
+        #     设置文本既不写入，也不会因输入框已不可填写而清空；重要日期残留的是
+        #     无效日期（2023-02-29）也不校验、不报错，不妨碍同次地区的有效修改。
+        #     两名客户各自保留自己的原值，不能被写成同一个残留值。
+        s, d = batch_update([id_x, id_y], {
+            "source": {"op": "keep", "value": "残留文字不应写入"},
+            "region": {"op": "set", "value": "  共同地区  "},
+            "industry": {"op": "keep", "value": "残留行业"},
+            "important_date": {"op": "keep", "value": "2023-02-29"},
+        })
+        expect("最终 keep+另一字段 set：200 处理 2 名",
+               s == 200 and d == {"updated_count": 2}, (s, d))
+        x_now, y_now, z_now = client_by_id(id_x), client_by_id(id_y), client_by_id(id_z)
+        expect("keep 忽略残留文本：来源仍是各自原值",
+               x_now["source"] == "s1" and y_now["source"] == "s2", (x_now, y_now))
+        expect("keep 不因输入不可填写而清空：行业仍是各自原值",
+               x_now["industry"] == "i1" and y_now["industry"] == "i2", (x_now, y_now))
+        expect("keep 不校验残留无效日期：各自日期保留",
+               x_now["important_date"] == "2020-03-03"
+               and y_now["important_date"] == "2021-04-04", (x_now, y_now))
+        expect("另一字段按其最后操作保存（去前后空白、两人相同）",
+               x_now["region"] == "共同地区" and y_now["region"] == "共同地区",
+               (x_now, y_now))
+        expect("keep 残留不波及未选中客户",
+               z_now["source"] == "s3" and z_now["region"] == "r3", z_now)
+
+        # 21. 最终选择「清空」：即使修改说明里带着之前留下的文字或无效日期，
+        #     保存后也一律为未填写（null），不再校验那些残留内容。
+        s, d = batch_update([id_x, id_y], {
+            "source": {"op": "clear", "value": "残留文字"},
+            "important_date": {"op": "clear", "value": "2023-02-29"},
+        })
+        expect("最终 clear：200 处理 2 名", s == 200 and d == {"updated_count": 2}, (s, d))
+        x_now, y_now = client_by_id(id_x), client_by_id(id_y)
+        expect("clear 忽略残留文字：来源为 null",
+               x_now["source"] is None and y_now["source"] is None, (x_now, y_now))
+        expect("clear 忽略残留无效日期：日期为 null 且不报日期错误",
+               x_now["important_date"] is None and y_now["important_date"] is None,
+               (x_now, y_now))
+
+        # 22. 最终选择「设为填写的值」但只填空白：空串、空格、制表符、换行对四个
+        #     字段都按清空处理；重要日期仅填空白同样清空，不能报日期格式错误。
+        s, d = batch_update([id_x], {
+            "source": {"op": "set", "value": "临时来源"},
+            "region": {"op": "set", "value": "临时地区"},
+            "industry": {"op": "set", "value": "临时行业"},
+            "important_date": {"op": "set", "value": "2025-06-06"},
+        })
+        expect("空白 set 前置：先写非空值 200",
+               s == 200 and d == {"updated_count": 1}, (s, d))
+        s, d = batch_update([id_x], {
+            "source": {"op": "set", "value": ""},
+            "region": {"op": "set", "value": " \t \n "},
+            "industry": {"op": "set", "value": "   "},
+            "important_date": {"op": "set", "value": "  \n\t "},
+        })
+        expect("四字段空串/纯空白 set 200（不是 400 日期错误）",
+               s == 200 and d == {"updated_count": 1}, (s, d))
+        x_now = client_by_id(id_x)
+        expect("空串与纯空白全部落库为 null（含重要日期）",
+               x_now["source"] is None and x_now["region"] is None
+               and x_now["industry"] is None and x_now["important_date"] is None,
+               x_now)
+
+        # 23. 来源/地区/行业仅填空白与明确选择清空得到相同结果（null）。
+        s, d = batch_update([id_y], {"region": {"op": "set", "value": "\t\t "}})
+        expect("地区仅填空白 200", s == 200 and d == {"updated_count": 1}, (s, d))
+        s, d = batch_update([id_y], {"industry": {"op": "clear"}})
+        expect("行业明确清空 200", s == 200 and d == {"updated_count": 1}, (s, d))
+        y_now = client_by_id(id_y)
+        expect("纯空白 set 与 clear 结果一致（均为 null）",
+               y_now["region"] is None and y_now["industry"] is None, y_now)
+
+        # 24. 非空 set：只去除前后空白，内部空格、制表与换行按原规则保留。
+        s, d = batch_update([id_y], {
+            "source": {"op": "set", "value": "  来 源\tA  "},
+            "industry": {"op": "set", "value": "行 业\n第二行\t保留"},
+        })
+        expect("非空 set 200", s == 200 and d == {"updated_count": 1}, (s, d))
+        y_now = client_by_id(id_y)
+        expect("仅去前后空白、内部空白与换行保留",
+               y_now["source"] == "来 源\tA"
+               and y_now["industry"] == "行 业\n第二行\t保留", y_now)
+
+        # 25. 选中客户中某字段原本为空：set 其他字段不会从其他客户补值，keep 仍为空。
+        s, d = batch_update([id_y, id_z], {
+            "source": {"op": "set", "value": "批量来源"},
+            "industry": {"op": "keep"},
+        })
+        expect("含空值字段的批量 set：200 处理 2 名",
+               s == 200 and d == {"updated_count": 2}, (s, d))
+        z_now = client_by_id(id_z)
+        expect("原本为空的行业不被补入他人内容", z_now["industry"] is None, z_now)
+        expect("两人来源同为设置值，丙其余字段不变",
+               client_by_id(id_y)["source"] == "批量来源"
+               and z_now["source"] == "批量来源"
+               and z_now["region"] == "r3"
+               and z_now["important_date"] == "2022-05-05",
+               (client_by_id(id_y), z_now))
+
+        # 26. 拒绝：四个字段最终全部保持原值——即使修改说明里带着残留文字或无效
+        #     日期，也应拒绝并说明没有修改项，任何客户都不改变。
+        keep_snapshot = req("GET", "/api/clients")[1]
+        s, d = batch_update([id_x, id_y, id_z], {
+            "source": {"op": "keep", "value": "残留"},
+            "region": {"op": "keep"},
+            "industry": {"op": "keep", "value": "残留行业"},
+            "important_date": {"op": "keep", "value": "2023-02-29"},
+        })
+        expect("四字段全部 keep：400 拒绝",
+               s == 400 and "error" in d and "updated_count" not in d, (s, d))
+        expect("全部 keep 拒绝原因说明没有修改项",
+               "保持原值" in d["error"] and "清空" in d["error"], d)
+        expect("全部 keep 整次不写入", req("GET", "/api/clients")[1] == keep_snapshot)
+
+        # 27. 拒绝：重要日期最终选择设置且填写无效日期——整次修改拒绝，其他字段
+        #     不能先保存（原子性）。仅含空白的日期在第 22 步已按清空成功处理，与此区分。
+        bad_date_snapshot = req("GET", "/api/clients")[1]
+        s, d = batch_update([id_y, id_z], {
+            "source": {"op": "set", "value": "不应部分写入的来源"},
+            "industry": {"op": "clear"},
+            "important_date": {"op": "set", "value": "2023-13-01"},
+        })
+        expect("日期为不存在的日历日期：400", s == 400 and "error" in d, (s, d))
+        expect("无效日期原因含该值与日历日期说明",
+               "2023-13-01" in d["error"] and "日历" in d["error"], d)
+        expect("无效日期：来源/行业未被先保存",
+               req("GET", "/api/clients")[1] == bad_date_snapshot)
+        s, d = batch_update([id_y], {
+            "region": {"op": "set", "value": "不应写入"},
+            "important_date": {"op": "set", "value": "2023/02/29"},
+        })
+        expect("日期格式错误：400 且提示 YYYY-MM-DD",
+               s == 400 and "YYYY-MM-DD" in d["error"], d)
+        expect("日期格式错误同样整次不写入",
+               req("GET", "/api/clients")[1] == bad_date_snapshot)
     finally:
         proc.terminate()
         proc.wait(timeout=5)
