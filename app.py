@@ -477,14 +477,36 @@ function parseImportReport(data) {
   return {importedCount, failedCount, failures};
 }
 
-// 错误状态回复可能是 {error: "..."}，也可能只有一段纯文本错误说明。
-function readableError(data, raw) {
-  if (data && typeof data === "object" && !Array.isArray(data) &&
-      typeof data.error === "string" && data.error.trim()) {
-    return data.error;
+// 从已读取的错误回复原文中提取明确、可读的拒绝原因：
+// readOk 为 false 表示回复本身读取失败；raw 为回复原文。
+// 返回非空字符串表示拿到明确原因（已去首尾空白）；返回 null 表示没有可靠原因。
+// 只有回复对象中的非空文本 error，或「非空的纯文本错误说明」（原文无法解析成
+// JSON 时）才算明确原因：可解析为 JSON 却没有上述 error 的回复（如
+// {"message":"错误"}、null、"…" 等字符串形式的 JSON），或 error 只有空白、
+// 不是文本，都不能把整个结构当作原因；空回复、仅空白同样没有可靠原因。
+function rejectReason(raw, readOk) {
+  if (!readOk) return null;
+  let data = null;
+  let parsedJson = false;
+  if (raw.trim()) {
+    try {
+      data = JSON.parse(raw);
+      parsedJson = true;
+    } catch {
+      data = null;
+    }
   }
-  const text = (raw || "").trim();
-  return text ? text.slice(0, 200) : "";
+  // 优先 {error: "..."}：error 必须是非空文本（去掉首尾空白后仍有内容）。
+  if (parsedJson && data && typeof data === "object" && !Array.isArray(data) &&
+      typeof data.error === "string" && data.error.trim()) {
+    return data.error.trim();
+  }
+  // 只有回复不是 JSON 结构化数据时，才把纯文本原文当作说明。
+  if (!parsedJson) {
+    const text = raw.trim();
+    if (text) return text.slice(0, 200);
+  }
+  return null;
 }
 
 // 记录级失败（重复、字段错误）仍属于成功导入报告：合法的零新增、全部跳过与
@@ -501,12 +523,15 @@ function successReportHtml(report) {
   return html;
 }
 
-// 成功状态之外的统一口径：没有取得可靠结果，不显示任何成功数量，也不断言
-// 资料一定未变化；提示先核对客户列表，不自动补交文件。
+// 成功状态之外、以及 HTTP 400 却没有可靠拒绝原因时的统一口径：不显示任何成功
+// 数量或零新增，也不断言整份文件已拒绝、资料未变化或已经回滚；保留已知状态码，
+// 说明客户资料可能已经改变，请用户先核对客户列表再主动决定是否重新导入。
+// 已选文件与当前客户表格保留，不触发列表刷新，不自动补交文件。
 function unreliableReportHtml(prefix) {
   return '<div class="banner bad">' + prefix +
-    "没有取得可靠的导入结果，无法确认本次是否新增了客户；请先核对客户列表，" +
-    "再决定是否重新导入。已选文件保留，不会自动重新提交。</div>";
+    "没有取得可靠的导入结果，无法确认本次是否新增了客户，客户资料可能已经改变" +
+    "（不能断定本次导入完全没有生效）；请先核对客户列表，" +
+    "再决定是否重新导入。已选文件与当前客户表格保留，不会自动重新提交。</div>";
 }
 
 document.getElementById("import-form").addEventListener("submit", async e => {
@@ -529,8 +554,17 @@ document.getElementById("import-form").addEventListener("submit", async e => {
       return;
     }
 
-    // 先取原文再尝试解析：非成功状态可能只返回一段纯文本错误说明。
-    const raw = await res.text().catch(() => "");
+    // 先取原文再尝试解析：错误回复可能是 {error:"..."}、一段纯文本说明，
+    // 也可能是空回复；读取失败与读取成功要区分开。
+    let raw = "";
+    let readOk = true;
+    try {
+      raw = await res.text();
+    } catch {
+      // 回复无法读取：不知道服务是否已经写入，按无法确认处理。
+      readOk = false;
+      raw = "";
+    }
     let data = null;
     if (raw.trim()) {
       try {
@@ -541,18 +575,31 @@ document.getElementById("import-form").addEventListener("submit", async e => {
     }
 
     if (res.status === 400) {
-      // 现有约定：HTTP 400 表示整份文件拒绝，本次没有新增客户，资料保持原样。
-      const reason = readableError(data, raw) || "服务未给出具体原因";
-      showReport('<div class="banner bad">整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。<br>原因：' +
-        esc(reason) + "</div>");
+      // 只有 HTTP 400 且拿到明确、可读的拒绝原因时，才表示整份文件被拒绝、
+      // 本次没有新增客户、原有资料保持原样，并展示原因供修正。空回复、仅空白、
+      // 回复读取失败，或可解析成 JSON 却没有非空文本 error（如 {"message":"错误"}、
+      // null、字符串形式的 JSON；error 只有空白或不是文本同样不算）的 400
+      // 可能来自代理/网关，不能当作明确拒绝，也不展示原始 JSON。
+      const reason = rejectReason(raw, readOk);
+      if (reason) {
+        showReport('<div class="banner bad">整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。<br>原因：' +
+          esc(reason) + "</div>");
+        return;
+      }
+      const prefix = readOk
+        ? "导入未成功（HTTP 400），但回复中没有可读的拒绝原因："
+        : "导入未成功（HTTP 400），且回复无法读取：";
+      showReport(unreliableReportHtml(prefix));
       return;
     }
 
     if (!res.ok) {
       // 其他非成功状态：即使回复可解析，也不显示成功数量、不断言资料一定未变。
-      const detail = readableError(data, raw) || "服务未给出可展示的错误说明";
-      showReport(unreliableReportHtml("导入未成功（HTTP " + res.status + "）：" +
-        esc(detail) + "。<br>"));
+      const detail = rejectReason(raw, readOk);
+      const prefix = detail
+        ? "导入未成功（HTTP " + res.status + "）：" + esc(detail) + "。<br>"
+        : "导入未成功（HTTP " + res.status + "），服务没有给出可展示的错误说明：";
+      showReport(unreliableReportHtml(prefix));
       return;
     }
 
