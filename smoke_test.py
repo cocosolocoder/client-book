@@ -692,6 +692,166 @@ def main():
         expect("未选中客户与客户总数仍不变",
                client_by_id(id_u) == before_u
                and len(req("GET", "/api/clients")[1]["clients"]) == client_total)
+
+        # ===== 选择编号校验回归：编号数组混入不合格值必须整次拒绝 =====
+        # 31. 准备四名客户：号测甲/号测乙四个可修改字段互不相同，号测丙四个字段
+        #     导入时均未填写（验证空字段不会被先写入或从他人补值），号测丁不参与
+        #     选择（未选中对照）。
+        s, d = import_csv(
+            "name,source,region,industry,important_date\n"
+            "号测甲,sA,rA,iA,2010-01-01\n"
+            "号测乙,sB,rB,iB,2011-02-02\n"
+            "号测丙,,,,\n"
+            "号测丁,sD,rD,iD,2012-03-03\n"
+        )
+        expect("编号校验客户导入 4 新增", s == 200 and d["imported_count"] == 4, d)
+        id_g, id_h, id_i, id_j = (x["id"] for x in d["imported"])
+        before_g = client_by_id(id_g)
+        before_h = client_by_id(id_h)
+        before_i = client_by_id(id_i)
+        before_j = client_by_id(id_j)
+        expect("号测甲乙资料互不相同",
+               before_g["source"] != before_h["source"]
+               and before_g["region"] != before_h["region"]
+               and before_g["industry"] != before_h["industry"]
+               and before_g["important_date"] != before_h["important_date"],
+               (before_g, before_h))
+        expect("号测丙四字段原本为空",
+               all(before_i[f] is None for f in
+                   ("source", "region", "industry", "important_date")), before_i)
+        id_snapshot = req("GET", "/api/clients")[1]
+        id_total = len(id_snapshot["clients"])
+
+        # 同次请求带有完全可执行的设置与清空：编号不合格时这些合法字段操作也不允许先保存。
+        id_legal_updates = {
+            "source": {"op": "set", "value": " 不应保存的编号来源 "},
+            "industry": {"op": "clear"},
+        }
+
+        # 数字形式的文本（内容恰好等于已有编号也不接受）、浮点数（含写成 1.0 的值与
+        # 恰为某编号整数值的浮点）、布尔（不得当成编号 1 或 0）、null、零、负数，
+        # 均不是合法客户编号；无论排在合法编号之前还是之后都整次拒绝。
+        bad_id_values = [
+            ("数字形式的文本", "1"),
+            ("数字文本内容恰为选中编号", str(id_g)),
+            ("浮点 1.0", 1.0),
+            ("浮点 1.5", 1.5),
+            ("浮点值恰为已有编号", float(id_h)),
+            ("布尔 true", True),
+            ("布尔 false", False),
+            ("null", None),
+            ("零", 0),
+            ("负数 -1", -1),
+            ("负的已有编号", -id_g),
+        ]
+        for value_label, bad in bad_id_values:
+            for order_label, ids in (
+                ("不合格值在合法编号之前", [bad, id_g, id_h]),
+                ("不合格值在合法编号之后", [id_g, id_h, bad]),
+            ):
+                label = "%s（%s）" % (value_label, order_label)
+                s, d = batch_update(ids, id_legal_updates)
+                expect("不合格编号 400：" + label,
+                       s == 400 and "updated_count" not in d, (s, d, bad))
+                expect("原因非空可读且说明编号必须为正整数：" + label,
+                       isinstance(d.get("error"), str) and bool(d["error"].strip())
+                       and "正整数" in d["error"], d)
+                expect("整次拒绝不写入任何客户：" + label,
+                       req("GET", "/api/clients")[1] == id_snapshot)
+
+        # 全部拒绝后逐客户核对：选中客户的来源、地区、行业与重要日期分别保持自己的
+        # 原值（原本为空的仍为空），不能被统一成其中一名客户的内容；编号、名称、
+        # 客户总数与未选中客户都不变，也不表示部分客户已修改。
+        expect("号测甲四字段分别保持原值",
+               client_by_id(id_g) == {"id": id_g, "name": "号测甲", "source": "sA",
+                                      "region": "rA", "industry": "iA",
+                                      "important_date": "2010-01-01"},
+               client_by_id(id_g))
+        expect("号测乙四字段分别保持原值、未被统一成甲的内容",
+               client_by_id(id_h) == {"id": id_h, "name": "号测乙", "source": "sB",
+                                      "region": "rB", "industry": "iB",
+                                      "important_date": "2011-02-02"},
+               client_by_id(id_h))
+        expect("号测丙原本为空的字段仍为空",
+               client_by_id(id_i) == {"id": id_i, "name": "号测丙", "source": None,
+                                      "region": None, "industry": None,
+                                      "important_date": None},
+               client_by_id(id_i))
+        expect("未选中的号测丁不受影响", client_by_id(id_j) == before_j, client_by_id(id_j))
+        expect("编号校验拒绝后编号名称与客户总数不变",
+               client_by_id(id_g)["id"] == id_g and client_by_id(id_h)["id"] == id_h
+               and len(req("GET", "/api/clients")[1]["clients"]) == id_total)
+
+        # 32. 两个与选择直接相关的边界同样整次拒绝：空编号数组说明未选择客户；
+        #     ids 缺失或不是数组说明需要客户编号数组。updates 合法也不写入。
+        s, d = batch_update([], id_legal_updates)
+        expect("空编号数组 400 且无处理数量",
+               s == 400 and "updated_count" not in d, (s, d))
+        expect("空编号数组原因说明未选择客户",
+               isinstance(d.get("error"), str) and bool(d["error"].strip())
+               and "未选择客户" in d["error"], d)
+        expect("空编号数组整次不写入",
+               req("GET", "/api/clients")[1] == id_snapshot)
+
+        def batch_update_raw(payload):
+            body = json.dumps(payload).encode("utf-8")
+            r = urllib.request.Request(BASE + "/api/clients/batch-update", data=body,
+                                       method="POST",
+                                       headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(r) as resp:
+                    return resp.status, json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read().decode("utf-8"))
+
+        ids_shape_cases = [
+            ("缺少 ids", {"updates": id_legal_updates}),
+            ("ids 为 null", {"ids": None, "updates": id_legal_updates}),
+            ("ids 为文本", {"ids": str(id_g), "updates": id_legal_updates}),
+            ("ids 为数字", {"ids": id_g, "updates": id_legal_updates}),
+            ("ids 为对象", {"ids": {str(id_g): True}, "updates": id_legal_updates}),
+        ]
+        for label, payload in ids_shape_cases:
+            s, d = batch_update_raw(payload)
+            expect("编号集合缺失或不是数组 400：" + label,
+                   s == 400 and "updated_count" not in d, (s, d))
+            expect("原因非空可读且说明需要客户编号数组：" + label,
+                   isinstance(d.get("error"), str) and bool(d["error"].strip())
+                   and "客户编号数组" in d["error"], d)
+            expect("编号形状错误整次不写入：" + label,
+                   req("GET", "/api/clients")[1] == id_snapshot)
+
+        # 33. 移除不合格值、只保留实际存在的整数编号后，同样的合法字段修改正常
+        #     成功：只影响明确要求设置/清空的字段，未要求修改（省略说明）的字段
+        #     各自保留原值；重复出现的合法编号只算一名客户。
+        s, d = batch_update([id_g, id_g, id_h, id_i, id_g], {
+            "source": {"op": "set", "value": "  统一新来源  "},
+            "industry": {"op": "clear"},
+        })
+        expect("移除不合格值后 200 且重复编号去重处理 3 名",
+               s == 200 and d == {"updated_count": 3}, (s, d))
+        g_now, h_now, i_now = client_by_id(id_g), client_by_id(id_h), client_by_id(id_i)
+        expect("明确设置的来源写入全部选中客户（去前后空白）",
+               g_now["source"] == "统一新来源" and h_now["source"] == "统一新来源"
+               and i_now["source"] == "统一新来源", (g_now, h_now, i_now))
+        expect("明确清空的行业为 null（含原本为空者）",
+               g_now["industry"] is None and h_now["industry"] is None
+               and i_now["industry"] is None, (g_now, h_now, i_now))
+        expect("未要求修改的地区各自保留原值、不被统一",
+               g_now["region"] == "rA" and h_now["region"] == "rB"
+               and i_now["region"] is None, (g_now, h_now, i_now))
+        expect("未要求修改的重要日期各自保留原值、不被统一",
+               g_now["important_date"] == "2010-01-01"
+               and h_now["important_date"] == "2011-02-02"
+               and i_now["important_date"] is None, (g_now, h_now, i_now))
+        expect("编号与名称不变",
+               g_now["id"] == id_g and g_now["name"] == "号测甲"
+               and h_now["id"] == id_h and h_now["name"] == "号测乙"
+               and i_now["id"] == id_i and i_now["name"] == "号测丙",
+               (g_now, h_now, i_now))
+        expect("未选中客户与客户总数仍不变",
+               client_by_id(id_j) == before_j
+               and len(req("GET", "/api/clients")[1]["clients"]) == id_total)
     finally:
         proc.terminate()
         proc.wait(timeout=5)
