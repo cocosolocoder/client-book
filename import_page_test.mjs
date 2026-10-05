@@ -25,11 +25,18 @@
  * E. 正常导入并成功刷新列表的路径，以及整份文件被明确拒绝（HTTP 400）时
  *    原有错误说明与资料不变的行为继续保留；网络失败与其他非成功状态同样按
  *    「无法确认」处理。
+ * H. HTTP 400 只在有明确可读原因（对象非空文本 error / 非空纯文本，去首尾
+ *    空白，特殊字符按文字展示）时才提示整份文件拒绝、本次零新增、资料保持
+ *    原样；空回复、仅含空白、回复体读取失败、可解析为 JSON 但无合格 error
+ *    （{"message":...}、null、字符串形式 JSON 等）、error 为空白或非文本，
+ *    一律保留 HTTP 400 按无法确认处理：不展示原始 JSON、不显示数量、不声称
+ *    回滚或整份拒绝，文件与旧表保留、不刷新列表、不自动重发。缺少 name
+ *    表头、UTF-8 编码错误、引号结构损坏等真实文件级错误仍走明确拒绝。
  */
 import {spawn} from "node:child_process";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
-import {mkdtempSync, mkdirSync, rmSync, writeFileSync} from "node:fs";
+import {mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import puppeteer from "puppeteer";
 
@@ -132,7 +139,7 @@ async function listClients(base) {
 // ---------------------------------------------------------------------------
 // 页面驱动：拦截导入请求与导入后的客户列表读取
 // ---------------------------------------------------------------------------
-async function openSession(browser, base) {
+async function openSession(browser, base, options = {}) {
   const page = await browser.newPage();
   const modes = {
     // ok 正常转发；close 连接断开；500 非成功状态；bad-json 无法解析；
@@ -144,6 +151,30 @@ async function openSession(browser, base) {
     importAbort: false,
   };
   const counts = {importPosts: 0, listGets: 0};
+
+  // options.importReadFailStatus：让导入请求拿到该状态码，但回复体由一个
+  // 在读取时即失败的 ReadableStream 承载——res.status 可读而 res.text()
+  // 拒绝，模拟「连接在投递响应体过程中断开」。请求不离开页面，后端收不到。
+  if (options.importReadFailStatus) {
+    await page.evaluateOnNewDocument((status) => {
+      const origFetch = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const url = input && input.url ? input.url : String(input);
+        if (url.includes("/api/clients/import")) {
+          const stream = new ReadableStream({
+            start(controller) {
+              controller.error(new TypeError("unexpected end of stream"));
+            },
+          });
+          return Promise.resolve(new Response(stream, {
+            status,
+            headers: {"Content-Type": "application/json; charset=utf-8"},
+          }));
+        }
+        return origFetch(input, init);
+      };
+    }, options.importReadFailStatus);
+  }
 
   await page.setRequestInterception(true);
   page.on("request", request => {
@@ -813,6 +844,230 @@ async function run() {
           real2.clients.map(x => x.name));
         await page.close();
       }
+    }
+
+    // ===================================================================
+    // 场景 H：HTTP 400 只有在拿到明确、可读的拒绝原因时才是「整份文件拒绝、
+    //         本次没有新增客户、原有资料保持原样」；空回复、仅含空白、读取
+    //         回复失败、能解析成 JSON 却没有合格 error（含 error 为空白/非
+    //         文本）一律按无法确认处理。真实文件级错误仍走明确拒绝。
+    // ===================================================================
+    {
+      const server = await startServer("fourhundred");
+      servers.push(server);
+      const {base} = server;
+      await seed(base, ["四百前已有客户"]);
+
+      // H1：400 但没有可靠拒绝原因的各种回复——都不能当成明确拒绝
+      const noReasonCases = [
+        {name: "JSON 只有 message", body: JSON.stringify({message: "错误"})},
+        {name: "回复为 null", body: "null"},
+        {name: "字符串形式的 JSON", body: JSON.stringify("错误原因")},
+        {name: "JSON 数字", body: "42"},
+        {name: "JSON 数组（元素对象里带 error 也不算）",
+          body: JSON.stringify([{error: "x"}])},
+        {name: "error 只有空白", body: JSON.stringify({error: "  \t \n "})},
+        {name: "error 不是文本（数字）", body: JSON.stringify({error: 123})},
+        {name: "error 不是文本（布尔）", body: JSON.stringify({error: true})},
+        {name: "error 为 null", body: JSON.stringify({error: null})},
+        {name: "空回复", ct: "text/plain; charset=utf-8", body: ""},
+        {name: "仅含空白的纯文本", ct: "text/plain; charset=utf-8", body: "   "},
+      ];
+
+      for (const c of noReasonCases) {
+        const ctx = `H 400 无可靠原因（${c.name}）`;
+        const session = await openSession(browser, base);
+        const {page, modes} = session;
+        await uploadCsv(page, "no-reason.csv", buildCsv(["name"], [["不会到达后端的新客户"]]));
+        modes.importOverride = {
+          status: 400,
+          contentType: c.ct || "application/json; charset=utf-8",
+          body: c.body,
+        };
+        await submitImport(session);
+        modes.importOverride = null;
+        const snap = await importSnap(page);
+
+        expectUnconfirmed(snap, ctx);
+        check(`${ctx}：保留已知 HTTP 400、说明没有取得可靠拒绝原因`,
+          snap.reportText.includes("HTTP 400") &&
+          snap.reportText.includes("没有可靠的拒绝原因"),
+          snap.reportText);
+        check(`${ctx}：不按整份文件拒绝口径（不说未新增/保持原样/已回滚）`,
+          !/整份文件|没有新增客户|保持原样|已经回滚/.test(snap.reportText),
+          snap.reportText);
+        check(`${ctx}：说明客户资料可能已经改变`,
+          snap.reportText.includes("客户资料可能已经改变"), snap.reportText);
+        check(`${ctx}：不展示原始 JSON/结构，页面没有 undefined/NaN/[object Object]`,
+          !snap.reportText.includes("{") && !snap.reportText.includes("message") &&
+          !/undefined|NaN|\[object Object\]/.test(snap.reportText),
+          snap.reportText);
+        check(`${ctx}：旧表保留（拒绝前的一名客户）、不显示空列表/读取失败提示`,
+          snap.rows.length === 1 && snap.rows[0].cells[0] === "四百前已有客户" &&
+          !snap.emptyOn && !snap.loadErrorOn,
+          {rows: snap.rows.map(r => r.cells[0]), err: snap.loadErrorOn});
+        check(`${ctx}：不触发导入后的列表读取（全程只有打开页面时 1 次 GET）`,
+          session.counts.listGets === 1, `gets=${session.counts.listGets}`);
+        expectButtonAndFileKept(snap, ctx, "no-reason.csv", session);
+        await page.close();
+      }
+
+      // H2：400 且原因明确——纯文本说明与 JSON error 都按整份拒绝展示；
+      //     原因去首尾空白，特殊字符按文字展示。
+      {
+        const session = await openSession(browser, base);
+        const {page, modes} = session;
+        await uploadCsv(page, "plain-reason.csv", buildCsv(["name"], [["某新客户"]]));
+        modes.importOverride = {
+          status: 400,
+          contentType: "text/plain; charset=utf-8",
+          body: "  纯文本拒绝原因  \n",
+        };
+        await submitImport(session);
+        modes.importOverride = null;
+        const snap = await importSnap(page);
+
+        check("H 400 纯文本原因：显示整份文件已拒绝、本次没有新增客户、原有资料保持原样",
+          snap.banners.length === 1 && snap.banners[0].cls.includes("bad") &&
+          snap.reportText.includes("整份文件已拒绝导入") &&
+          snap.reportText.includes("本次没有新增客户") &&
+          snap.reportText.includes("原有客户资料保持原样") &&
+          snap.reportText.includes("纯文本拒绝原因"),
+          snap.banners);
+        check("H 400 纯文本原因：展示时去掉首尾空白（不夹带空白与换行）",
+          await page.evaluate(() => {
+            const html = document.getElementById("report").innerHTML;
+            return html.includes("原因：纯文本拒绝原因</div>") &&
+              !html.includes("原因： 纯文本拒绝原因");
+          }),
+          await page.evaluate(() => document.getElementById("report").innerHTML));
+        check("H 400 纯文本原因：不显示无法确认口径与成功数量、旧表保留",
+          !/无法确认|新增\s*\d+\s*条/.test(snap.reportText) &&
+          snap.rows.length === 1 && !snap.emptyOn,
+          snap.reportText);
+        expectButtonAndFileKept(snap, "H 400 纯文本原因", "plain-reason.csv", session);
+        await page.close();
+      }
+
+      {
+        const session = await openSession(browser, base);
+        const {page, modes} = session;
+        await uploadCsv(page, "json-reason.csv", buildCsv(["name"], [["某新客户"]]));
+        const rawReason = "  原因含 <tag> & \"引号\" '单引号'  ";
+        modes.importOverride = {
+          status: 400,
+          contentType: "application/json; charset=utf-8",
+          body: JSON.stringify({error: rawReason}),
+        };
+        await submitImport(session);
+        modes.importOverride = null;
+        const snap = await importSnap(page);
+
+        check("H 400 JSON error：按整份文件拒绝展示并给出原因",
+          snap.banners.length === 1 && snap.banners[0].cls.includes("bad") &&
+          snap.reportText.includes("整份文件已拒绝导入") &&
+          snap.reportText.includes("本次没有新增客户") &&
+          snap.reportText.includes("原有客户资料保持原样"),
+          snap.banners);
+        check("H 400 JSON error：原因去首尾空白、特殊字符按文字展示（不作为标签/属性解析）",
+          snap.reportText.includes("原因含 <tag> & \"引号\" '单引号'") &&
+          !snap.reportText.includes("原因含  ") &&
+          (await page.evaluate(() =>
+            document.querySelectorAll("#report tag").length === 0 &&
+            !document.getElementById("report").innerHTML.includes("原因： 原因含"))),
+          snap.reportText);
+        expectButtonAndFileKept(snap, "H 400 JSON error", "json-reason.csv", session);
+        await page.close();
+      }
+
+      // H3：读取回复失败——状态码 400 可读但响应体读取抛错：没有可靠原因，
+      //     按无法确认处理（模拟响应体投递中途断连，请求不触达后端）。
+      {
+        const session = await openSession(browser, base, {importReadFailStatus: 400});
+        const {page} = session;
+        await uploadCsv(page, "read-fail.csv", buildCsv(["name"], [["读取失败新客"]]));
+        await submitImport(session);
+        const snap = await importSnap(page);
+
+        expectUnconfirmed(snap, "H 400 回复无法读取");
+        check("H 400 回复无法读取：保留 HTTP 400 并说明回复无法读取、没有可靠原因",
+          snap.reportText.includes("HTTP 400") &&
+          snap.reportText.includes("导入回复无法读取"),
+          snap.reportText);
+        check("H 400 回复无法读取：不按整份文件拒绝口径",
+          !/整份文件|没有新增客户|保持原样|已经回滚/.test(snap.reportText),
+          snap.reportText);
+        check("H 400 回复无法读取：旧表保留、不触发列表读取、不自动重发",
+          snap.rows.length === 1 && snap.rows[0].cells[0] === "四百前已有客户" &&
+          !snap.emptyOn && session.counts.listGets === 1 &&
+          session.counts.importPosts === 0,
+          {rows: snap.rows.map(r => r.cells[0]), gets: session.counts.listGets,
+            posts: session.counts.importPosts});
+        check("H 400 回复无法读取：导入按钮恢复可用、已选文件保留",
+          !snap.submitDisabled && snap.fileCount === 1 &&
+          snap.filename === "read-fail.csv",
+          {disabled: snap.submitDisabled, count: snap.fileCount});
+        await page.close();
+      }
+
+      // H4：真实文件级错误（缺少 name 表头、UTF-8 编码错误、引号结构损坏）
+      //     仍返回有效 error 原因：继续明确显示整份文件拒绝、本次没有新增、
+      //     原有资料保持原样，并给出具体原因。
+      const fileErrorCases = [
+        {
+          name: "缺少 name 表头",
+          file: "no-name.csv",
+          content: "source,region\n展会,华东\n",
+          reasonPart: "name",
+        },
+        {
+          name: "UTF-8 编码错误",
+          file: "not-utf8.csv",
+          bytes: Buffer.concat([Buffer.from("name\n", "utf8"), Buffer.from([0xff, 0xfe, 0x80])]),
+          reasonPart: "UTF-8",
+        },
+        {
+          name: "引号结构损坏（结束引号后多余字符，bad2.csv 同类）",
+          file: "bad2.csv",
+          bytes: readFileSync(join(HERE, "bad2.csv")),
+          reasonPart: "结束引号",
+        },
+      ];
+      for (const c of fileErrorCases) {
+        const ctx = `H 真实文件级错误（${c.name}）`;
+        const session = await openSession(browser, base);
+        const {page} = session;
+        const path = join(TMP, "uploads", c.file);
+        mkdirSync(join(TMP, "uploads"), {recursive: true});
+        if (c.bytes) writeFileSync(path, c.bytes);
+        else writeFileSync(path, c.content, "utf8");
+        await page.$("#file-input").then(input => input.uploadFile(path));
+        await page.waitForFunction(name => document.getElementById("filename").textContent === name,
+          {}, c.file);
+        await submitImport(session);
+        const snap = await importSnap(page);
+
+        check(`${ctx}：明确显示整份文件已拒绝、本次没有新增客户、原有资料保持原样`,
+          snap.banners.length === 1 && snap.banners[0].cls.includes("bad") &&
+          snap.reportText.includes("整份文件已拒绝导入") &&
+          snap.reportText.includes("本次没有新增客户") &&
+          snap.reportText.includes("原有客户资料保持原样"),
+          snap.banners);
+        check(`${ctx}：展示后端给出的具体原因（${c.reasonPart}），不进无法确认口径`,
+          snap.reportText.includes(c.reasonPart) && !/无法确认/.test(snap.reportText),
+          snap.reportText);
+        check(`${ctx}：旧表保留、无空列表/读取失败提示`,
+          snap.rows.length === 1 && snap.rows[0].cells[0] === "四百前已有客户" &&
+          !snap.emptyOn && !snap.loadErrorOn,
+          snap.rows.map(r => r.cells[0]));
+        expectButtonAndFileKept(snap, ctx, c.file, session);
+        await page.close();
+      }
+
+      const real = await listClients(base);
+      check("H 收尾：所有被拦截/文件级错误的导入都未新增客户，后端仍是原来的一名",
+        real.clients.length === 1 && real.clients[0].name === "四百前已有客户",
+        real.clients.map(x => x.name));
     }
 
     await browser.close();

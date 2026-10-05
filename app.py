@@ -477,14 +477,21 @@ function parseImportReport(data) {
   return {importedCount, failedCount, failures};
 }
 
-// 错误状态回复可能是 {error: "..."}，也可能只有一段纯文本错误说明。
-function readableError(data, raw) {
-  if (data && typeof data === "object" && !Array.isArray(data) &&
-      typeof data.error === "string" && data.error.trim()) {
-    return data.error;
+// 非成功状态的可读原因：优先回复对象中的非空文本 error；只有回复不是 JSON
+// 结构化数据时，才把纯文本原文（去首尾空白）当作说明。能解析成 JSON 却没有
+// 合格 error 的回复（如 {"message":"..."}、null、[]、字符串形式的 JSON），
+// 或 error 只有空白、不是文本，都不算可读原因：不能把整个结构倾倒给用户。
+// parsed 表示回复是否成功解析为 JSON；空回复、仅含空白同样返回空串。
+function readableError(parsed, data, raw) {
+  if (parsed) {
+    if (data && typeof data === "object" && !Array.isArray(data) &&
+        typeof data.error === "string") {
+      const reason = data.error.trim();
+      if (reason) return reason;
+    }
+    return "";
   }
-  const text = (raw || "").trim();
-  return text ? text.slice(0, 200) : "";
+  return (raw || "").trim().slice(0, 200);
 }
 
 // 记录级失败（重复、字段错误）仍属于成功导入报告：合法的零新增、全部跳过与
@@ -501,12 +508,15 @@ function successReportHtml(report) {
   return html;
 }
 
-// 成功状态之外的统一口径：没有取得可靠结果，不显示任何成功数量，也不断言
-// 资料一定未变化；提示先核对客户列表，不自动补交文件。
+// 成功状态之外的统一口径：没有取得可靠结果，不显示任何成功数量或零新增，
+// 也不断言资料一定未变化、已经回滚或整份文件已拒绝；保留已知的 HTTP 状态码，
+// 提示先核对客户列表，不自动补交文件。已选文件与当前客户表格保留，
+// 这一分支不触发导入后的列表读取。
 function unreliableReportHtml(prefix) {
   return '<div class="banner bad">' + prefix +
-    "没有取得可靠的导入结果，无法确认本次是否新增了客户；请先核对客户列表，" +
-    "再决定是否重新导入。已选文件保留，不会自动重新提交。</div>";
+    "没有取得可靠的导入结果，无法确认本次是否新增了客户，客户资料可能已经改变；" +
+    "请先核对客户列表，再决定是否重新导入。已选文件与当前客户列表均已保留，" +
+    "不会清空客户、不会自动重新提交。</div>";
 }
 
 document.getElementById("import-form").addEventListener("submit", async e => {
@@ -529,39 +539,64 @@ document.getElementById("import-form").addEventListener("submit", async e => {
       return;
     }
 
-    // 先取原文再尝试解析：非成功状态可能只返回一段纯文本错误说明。
-    const raw = await res.text().catch(() => "");
+    // 先取原文再尝试解析：错误回复可能是 {error:"..."}、一段纯文本说明，
+    // 也可能是空回复。回复读取失败时不知道服务是否已写入，按无法确认处理。
+    let raw = "";
+    try {
+      raw = await res.text();
+    } catch (readErr) {
+      showReport(unreliableReportHtml("导入回复无法读取（HTTP " + res.status + "）："));
+      return;
+    }
+    // parsed 区分「回复确实解析成了 JSON 结构」与「只是纯文本」：
+    // 可解析但不含合格 error 的 JSON（如 {"message":"..."}、null、字符串形式的
+    // JSON）不能把整个结构当作拒绝原因；空回复与仅含空白两者都不算可读原因。
     let data = null;
+    let parsed = false;
     if (raw.trim()) {
       try {
         data = JSON.parse(raw);
+        parsed = true;
       } catch {
         data = null;
+        parsed = false;
       }
     }
 
     if (res.status === 400) {
-      // 现有约定：HTTP 400 表示整份文件拒绝，本次没有新增客户，资料保持原样。
-      const reason = readableError(data, raw) || "服务未给出具体原因";
-      showReport('<div class="banner bad">整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。<br>原因：' +
-        esc(reason) + "</div>");
+      // 只有 HTTP 400 且拿到明确、可读的拒绝原因（对象的非空文本 error，
+      // 或非空的纯文本错误说明，展示去首尾空白）时，才能确认整份文件被拒绝、
+      // 本次没有新增客户、原有资料保持原样。空回复、仅含空白、回复无法读取、
+      // 能解析成 JSON 却没有合格 error、error 只有空白或不是文本的，一律不能
+      // 当成明确拒绝：按无法确认处理，不展示原始 JSON，也不声称资料未变或已回滚。
+      const reason = readableError(parsed, data, raw);
+      if (reason) {
+        showReport('<div class="banner bad">整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。<br>原因：' +
+          esc(reason) + "</div>");
+        return;
+      }
+      showReport(unreliableReportHtml(
+        "导入未成功（HTTP 400），但回复中没有可靠的拒绝原因："));
       return;
     }
 
     if (!res.ok) {
-      // 其他非成功状态：即使回复可解析，也不显示成功数量、不断言资料一定未变。
-      const detail = readableError(data, raw) || "服务未给出可展示的错误说明";
-      showReport(unreliableReportHtml("导入未成功（HTTP " + res.status + "）：" +
-        esc(detail) + "。<br>"));
+      // 其他非成功状态（如 HTTP 500/502）：即使回复可解析，也不显示成功数量、
+      // 不断言资料一定未变或已经回滚——客户资料可能已被修改。保留已知状态码
+      // 与可读说明；没有可用说明时给出清楚的通用提示。
+      const detail = readableError(parsed, data, raw);
+      showReport(unreliableReportHtml(detail
+        ? "导入未成功（HTTP " + res.status + "）：" + esc(detail) + "。"
+        : "导入未成功（HTTP " + res.status + "），服务没有给出可展示的错误说明："));
       return;
     }
 
     // 成功状态：只有报告完整可校验时才显示新增/未导入数量与逐条原因。
     const report = parseImportReport(data);
     if (!report) {
-      const problem = data === null
-        ? "回复内容无法解析"
-        : "导入报告不完整，或数量、未导入明细不符合约定";
+      const problem = parsed
+        ? "导入报告不完整，或数量、未导入明细不符合约定"
+        : "回复内容无法解析";
       showReport('<div class="banner bad">导入请求已返回成功状态，但' + problem +
         "：本次导入是否生效、新增了多少客户均无法确认，不能按零新增或空明细补算成功结果；" +
         "请先核对客户列表，再决定是否重新导入。已选文件保留，不会自动重新提交。</div>");
