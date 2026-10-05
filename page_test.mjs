@@ -690,6 +690,29 @@ async function run() {
       }
 
       // ===================================================================
+      // 场景 G2：updated_count 为 0 仍是有效数量——按回复显示成功 0 名并
+      //          完成清理，不因数量为 0 而改按无法确认处理
+      // ===================================================================
+      {
+        const session = await openSession(browser, base);
+        const {page, modes} = session;
+        await selectRows(page, [a]);
+        await chooseSet(page, "region", "零也是有效数量");
+        modes.batchOverride = {status: 200, body: JSON.stringify({updated_count: 0})};
+        await saveAndSettle(session);
+        const snap = await snapshot(page);
+
+        check("G2 回复 0 名：按成功处理并显示 0 名，不按无法确认处理",
+          snap.banners.some(x => x.cls.includes("ok") &&
+            /已成功处理\s*0\s*名客户/.test(x.text)) &&
+          !unconfirmedBanner(snap),
+          snap.banners);
+        check("G2 回复 0 名：勾选与编辑同样完成清理、按钮恢复禁用",
+          cleanedUp(snap), {sel: snap.selCount, fields: snap.fields});
+        await page.close();
+      }
+
+      // ===================================================================
       // 场景 K：保存请求没有可靠结论——一律按「无法确认」处理：
       //   只有 HTTP 400 且有可读原因才是明确拒绝；500/502 等非成功状态即使
       //   带有可解析的错误说明也不能声称资料保持原样；空回复、无法解析内容、
@@ -832,13 +855,27 @@ async function run() {
         await page.close();
       }
 
-      // K5：成功状态但回复无法解析 / 缺少有效处理数量——仍按无法确认
+      // K5：成功状态但回复无法解析 / 缺少有效处理数量——仍按无法确认。
+      //     有效数量仅限非负整数数字：负数、小数、数字形式的文本、布尔值、
+      //     null、字段缺失都不能取整、转型或补零后当作成功数量。
       for (const [label, override, phrase] of [
         ["200 不可解析", {status: 200, ct: "text/plain; charset=utf-8",
           body: "<<<not valid json>>>"}, "回复内容无法解析"],
         ["200 缺数量", {status: 200, body: JSON.stringify({unexpected: true})},
           "没有有效的处理数量"],
         ["200 空回复", {status: 200, body: ""}, "回复内容无法解析"],
+        ["200 数量为负数", {status: 200, body: JSON.stringify({updated_count: -1})},
+          "没有有效的处理数量"],
+        ["200 数量为小数", {status: 200, body: JSON.stringify({updated_count: 1.5})},
+          "没有有效的处理数量"],
+        ["200 数量为文本", {status: 200, body: JSON.stringify({updated_count: "3"})},
+          "没有有效的处理数量"],
+        ["200 数量为布尔", {status: 200, body: JSON.stringify({updated_count: true})},
+          "没有有效的处理数量"],
+        ["200 数量为 null", {status: 200, body: JSON.stringify({updated_count: null})},
+          "没有有效的处理数量"],
+        ["200 数量为数组", {status: 200, body: JSON.stringify({updated_count: [2]})},
+          "没有有效的处理数量"],
       ]) {
         const session = await openSession(browser, base);
         const {page, modes} = session;

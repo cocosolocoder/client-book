@@ -398,7 +398,9 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
     const count = data && typeof data === "object" && !Array.isArray(data)
       ? data.updated_count
       : undefined;
-    if (typeof count !== "number" || !Number.isFinite(count)) {
+    // 有效数量必须是非负整数数字（0 有效）：负数、小数、数字形式的文本、
+    // 布尔值、null、缺失字段都不算；不做取整、转型或补零。
+    if (!isNonNegativeInt(count)) {
       // 成功状态但回复无法解析或缺少有效处理数量：仍不知道修改是否生效，
       // 不显示成功数量、不做保存成功后的清理，按无法确认处理。
       const problem = data === null ? "回复内容无法解析" : "回复中没有有效的处理数量";
