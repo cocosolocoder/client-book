@@ -560,7 +560,7 @@ document.getElementById("import-form").addEventListener("submit", async e => {
       // 当成明确拒绝：按无法确认处理，不展示原始 JSON，也不声称资料未变或已回滚。
       const reason = serviceReadableError(parsed, data, raw, true);
       if (reason) {
-        showReport('<div class="banner bad">整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。<br>原因：' +
+        showReport('<div class="banner bad">整次导入未保存，整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。<br>原因：' +
           esc(reason) + "</div>");
         return;
       }
@@ -973,15 +973,40 @@ def import_clients(database, text):
             record[field_name] = value or None
         imported.append((row_number, record))
 
+    # 有效新客户在同一事务内逐条写入并只在最后提交一次：写入中途或最终提交
+    # 出现数据库错误时，整笔回滚已写入的新客户，并在确认本次新增确实没有
+    # 残留后才以文件级错误（HTTP 400）拒绝整次导入——不返回新增/未导入
+    # 数量或成功报告，也不能让本次客户留在连接的未提交事务里被之后的请求
+    # 顺带提交。回滚或确认失败时不给出「本次没有新增客户」的承诺，按未取得
+    # 可靠结论处理（原始数据库错误继续向上抛）。
     saved = []
-    for row_number, record in imported:
-        cursor = database.execute(
-            "INSERT INTO clients (name, source, region, industry, important_date)"
-            " VALUES (:name, :source, :region, :industry, :important_date)",
-            record,
-        )
-        saved.append({"row": row_number, "id": cursor.lastrowid, "name": record["name"]})
-    database.commit()
+    try:
+        for row_number, record in imported:
+            cursor = database.execute(
+                "INSERT INTO clients (name, source, region, industry, important_date)"
+                " VALUES (:name, :source, :region, :industry, :important_date)",
+                record,
+            )
+            saved.append({"row": row_number, "id": cursor.lastrowid, "name": record["name"]})
+        database.commit()
+    except sqlite3.DatabaseError as save_exc:
+        # 本次没有任何需要保存的新客户时（如只有表头），不进入保存失败口径，
+        # 保持既有行为：原始数据库错误继续向上抛。
+        if not saved:
+            raise
+        database.rollback()
+        leftover = 0
+        saved_ids = [item["id"] for item in saved]
+        for id_chunk in _chunked(saved_ids, sql_variable_limit(database)):
+            placeholders = ",".join("?" for _ in id_chunk)
+            leftover += database.execute(
+                "SELECT COUNT(*) FROM clients WHERE id IN (%s)" % placeholders, id_chunk
+            ).fetchone()[0]
+        if leftover:
+            raise
+        raise FileError(
+            "数据库保存失败：已撤销本次写入的全部新客户，本次没有新增客户，"
+            "原有客户的编号、名称和各项资料保持原样，请稍后重新提交该文件") from save_exc
 
     return {
         "imported_count": len(saved),
