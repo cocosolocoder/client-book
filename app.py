@@ -625,6 +625,10 @@ class FileError(Exception):
     """文件级错误：整份文件拒绝导入（HTTP 400）。"""
 
 
+class ImportSaveError(Exception):
+    """保存阶段数据库错误：已回滚本次全部新客户，整次导入拒绝（HTTP 400）。"""
+
+
 class BatchUpdateError(Exception):
     """批量修改请求级错误：整次修改拒绝（HTTP 400）。"""
 
@@ -973,15 +977,23 @@ def import_clients(database, text):
             record[field_name] = value or None
         imported.append((row_number, record))
 
+    # 全部有效新客户在同一事务内逐条写入并在最后一次提交：只要保存已经开始
+    # （已有一条 INSERT 执行），无论后续某条写入失败还是最终提交失败，都回滚
+    # 整笔事务——本次文件中的任何新客户都不保留，原有客户资料保持原样，
+    # 并以明确的保存失败错误拒绝整次导入，不返回任何新增数量。
     saved = []
-    for row_number, record in imported:
-        cursor = database.execute(
-            "INSERT INTO clients (name, source, region, industry, important_date)"
-            " VALUES (:name, :source, :region, :industry, :important_date)",
-            record,
-        )
-        saved.append({"row": row_number, "id": cursor.lastrowid, "name": record["name"]})
-    database.commit()
+    try:
+        for row_number, record in imported:
+            cursor = database.execute(
+                "INSERT INTO clients (name, source, region, industry, important_date)"
+                " VALUES (:name, :source, :region, :industry, :important_date)",
+                record,
+            )
+            saved.append({"row": row_number, "id": cursor.lastrowid, "name": record["name"]})
+        database.commit()
+    except sqlite3.DatabaseError:
+        database.rollback()
+        raise ImportSaveError("保存失败：数据库写入出错，本次导入已全部撤销，没有新增任何客户")
 
     return {
         "imported_count": len(saved),
@@ -1038,6 +1050,12 @@ def main():
             try:
                 result = import_clients(database, text)
             except FileError as exc:
+                database.rollback()
+                self.respond(400, {"error": str(exc)})
+                return
+            except ImportSaveError as exc:
+                # import_clients 已回滚本次全部新增；这里再确保连接上不留未提交
+                # 事务，避免后续请求（列表读取、其他导入、批量修改）顺带提交。
                 database.rollback()
                 self.respond(400, {"error": str(exc)})
                 return

@@ -844,6 +844,68 @@ async function run() {
           real2.clients.map(x => x.name));
         await page.close();
       }
+
+      // G4 保存阶段数据库失败：后端回滚本次全部新增后以 400 + 中文保存失败原因
+      // 拒绝整次导入。页面口径与文件级 400 完全一致：说明整次导入未保存并展示
+      // 原因，不显示任何数量，已选文件与原客户表保留，不触发列表刷新，按钮恢复。
+      {
+        const session = await openSession(browser, base);
+        const {page, modes} = session;
+        await uploadCsv(page, "db-save-fail.csv", buildCsv(
+          ["name", "source", "important_date"],
+          [
+            ["保存失败新客甲", "展会", "2024-01-01"],   // 后端已开始保存的有效新客
+            ["拒绝前已有客户", "", ""],                // 重复名称（记录级失败）
+            ["保存失败新客乙", "", "2025-13-40"],      // 无效日期（记录级失败）
+            ["保存失败新客丙", "门店", "2024-03-03"],
+          ]));
+        modes.importOverride = {
+          status: 400,
+          body: JSON.stringify({
+            error: "保存失败：数据库写入出错，本次导入已全部撤销，没有新增任何客户",
+          }),
+        };
+        const listGetsBefore = session.counts.listGets;
+        await submitImport(session);
+        modes.importOverride = null;
+        const snap = await importSnap(page);
+
+        check("G 保存失败 400：显示整份文件已拒绝、本次没有新增客户、原有资料保持原样",
+          snap.banners.length === 1 && snap.banners[0].cls.includes("bad") &&
+          snap.reportText.includes("整份文件已拒绝导入") &&
+          snap.reportText.includes("本次没有新增客户") &&
+          snap.reportText.includes("原有客户资料保持原样"),
+          snap.banners);
+        check("G 保存失败 400：展示数据库保存失败与本次零新增的具体原因",
+          snap.reportText.includes("保存失败") &&
+          snap.reportText.includes("数据库写入出错") &&
+          snap.reportText.includes("已全部撤销") &&
+          snap.reportText.includes("没有新增任何客户"),
+          snap.reportText);
+        check("G 保存失败 400：不显示新增/未导入数量、不渲染逐条明细、不说部分成功",
+          !/新增\s*\d+\s*条/.test(snap.reportText) &&
+          !/未导入\s*\d+\s*条/.test(snap.reportText) &&
+          snap.failureItems.length === 0 && !snap.failuresTitle,
+          snap.reportText);
+        check("G 保存失败 400：不进入无法确认口径、不提示可能已改变",
+          !/无法确认|可能已经改变/.test(snap.reportText), snap.reportText);
+        check("G 保存失败 400：原客户表保留（仍是此前已有的两名客户），不显示空列表",
+          snap.rows.length === 2 &&
+          snap.rows.some(r => r.cells[0] === "拒绝前已有客户") &&
+          snap.rows.some(r => r.cells[0] === "拒绝后新客") &&
+          !snap.rows.some(r => r.cells[0].startsWith("保存失败新客")) &&
+          !snap.emptyOn,
+          snap.rows.map(r => r.cells[0]));
+        check("G 保存失败 400：不触发导入后的列表读取",
+          session.counts.listGets === listGetsBefore,
+          `gets=${session.counts.listGets}`);
+        expectButtonAndFileKept(snap, "G 保存失败 400", "db-save-fail.csv", session);
+
+        await new Promise(r => setTimeout(r, 200));
+        check("G 保存失败 400：不会自动重新提交",
+          session.counts.importPosts === 1, `posts=${session.counts.importPosts}`);
+        await page.close();
+      }
     }
 
     // ===================================================================
