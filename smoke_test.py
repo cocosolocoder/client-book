@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """端到端冒烟测试：启动真实 HTTP 服务，覆盖需求各场景。"""
+import datetime
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -852,6 +854,170 @@ def main():
         expect("未选中客户与客户总数仍不变",
                client_by_id(id_j) == before_j
                and len(req("GET", "/api/clients")[1]["clients"]) == id_total)
+
+        # ===== 长名单一次保存回归：选中客户数超过 SQLite 单条语句参数上限 =====
+        # 名单长度超过运行时 SQLITE_MAX_VARIABLE_NUMBER 时，存在性检查与 UPDATE
+        # 都必须分块；本组验证分块后整次保存仍是一次请求一次提交，处理数量与
+        # 实际保存结果一致。长名单客户直接写入同一数据目录的 SQLite 库来准备
+        # （避免用导入接口组装超大文件）；修改与核对一律走公开的批量修改接口
+        # 与客户列表接口。
+        # 34. 准备 limit+50 名资料互不相同的长名单客户（含未填写字段），
+        #     末尾 3 名不选中，作为未选中对照。
+        sys.path.insert(0, str(Path(__file__).parent))
+        import app as clientbook_app
+        db_file = data_dir / "client-book.sqlite"
+        variable_limit = clientbook_app.sql_variable_limit(
+            sqlite3.connect(str(db_file)))
+        seed_count = variable_limit + 50
+
+        pre_seed = req("GET", "/api/clients")[1]
+        pre_seed_total = len(pre_seed["clients"])
+
+        long_source_value = "  长名单来源 含内部 空白\n第二行\t保留  "
+        long_source = long_source_value.strip()
+
+        def seed_row(i):
+            name = "长测%06d" % i
+            source = "旧来源%06d" % i
+            industry = "行业%06d" % i
+            if i % 13 == 0:  # 一部分客户的来源与行业原本未填写
+                source = None
+                industry = None
+            if i == 0:
+                source = long_source  # 原值已符合设置内容，仍应计入处理数量
+            region = None if i % 7 == 0 else "地区%06d" % i
+            date = None if i % 11 == 0 else str(
+                datetime.date(2000, 1, 1) + datetime.timedelta(days=i))
+            return (name, source, region, industry, date)
+
+        seed_conn = sqlite3.connect(str(db_file))
+        base_id = seed_conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM clients").fetchone()[0]
+        seed_conn.executemany(
+            "INSERT INTO clients (name, source, region, industry, important_date)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (seed_row(i) for i in range(seed_count)))
+        seed_conn.commit()
+        seed_ids = [row[0] for row in seed_conn.execute(
+            "SELECT id FROM clients WHERE id > ? ORDER BY id", (base_id,))]
+        seed_conn.close()
+        expect("长名单客户准备完毕", len(seed_ids) == seed_count, len(seed_ids))
+
+        selected_ids = seed_ids[:-3]
+        expect("长名单长度超过单条语句参数上限",
+               len(selected_ids) > variable_limit,
+               (len(selected_ids), variable_limit))
+
+        def expected_long(i, cid, was_selected):
+            name, source, region, industry, date = seed_row(i)
+            if was_selected:
+                source = long_source
+                industry = None
+            return {"id": cid, "name": name, "source": source, "region": region,
+                    "industry": industry, "important_date": date}
+
+        # 35. 一次提交整个长名单（同一编号在名单不同位置重复出现也只计一次）：
+        #     设置来源（去前后空白、内部空白与换行保留）、清空行业，
+        #     地区与重要日期保持原值。整次保存是一次请求一次提交，
+        #     不能拆成用户需要分别确认的多次修改。
+        dup_ids = [selected_ids[0], selected_ids[len(selected_ids) // 2],
+                   selected_ids[-1]]
+        s, d = batch_update(selected_ids + dup_ids, {
+            "source": {"op": "set", "value": long_source_value},
+            "industry": {"op": "clear"},
+            "region": {"op": "keep"},
+            "important_date": {"op": "keep"},
+        })
+        expect("长名单批量修改 200 且按去重后数量处理",
+               s == 200 and d == {"updated_count": len(selected_ids)}, (s, d))
+
+        s, d = req("GET", "/api/clients")
+        by_id = {c["id"]: c for c in d["clients"]}
+        expect("长名单保存后客户总数不变（未新建客户）",
+               s == 200 and len(d["clients"]) == pre_seed_total + seed_count,
+               (s, len(d["clients"])))
+        mismatches = []
+        for i, cid in enumerate(seed_ids):
+            want = expected_long(i, cid, i < len(selected_ids))
+            got = by_id.get(cid)
+            if got != want:
+                mismatches.append((cid, got, want))
+        expect("长名单逐客户核对：设置/清空生效，保持原值各自保留、空值不被补入",
+               not mismatches, mismatches[:2])
+        last_selected = by_id[selected_ids[-1]]
+        expect("名单末尾客户未遗漏",
+               last_selected["source"] == long_source
+               and last_selected["industry"] is None, last_selected)
+        expect("原值已符合设置内容的客户仍计入且内容正确",
+               by_id[seed_ids[0]] == expected_long(0, seed_ids[0], True),
+               by_id[seed_ids[0]])
+        expect("长名单末尾未选中的客户保持原资料",
+               all(by_id[seed_ids[i]] == expected_long(i, seed_ids[i], False)
+                   for i in range(seed_count - 3, seed_count)))
+        changed_others = [c for c in pre_seed["clients"]
+                          if by_id.get(c["id"]) != c]
+        expect("未选中的既有客户全部保持原样", not changed_others,
+               changed_others[:1])
+
+        # 36. 长名单末尾混入一个找不到的编号：前面的编号都有效、字段修改也合法，
+        #     仍整次拒绝（HTTP 400 + 指出缺失编号的可读原因，不返回处理数量），
+        #     所有客户保持提交前的资料，名单前面的客户不能先发生改变。
+        ghost = base_id + seed_count + 1000
+        s, d = batch_update(selected_ids + [ghost], {
+            "source": {"op": "set", "value": "不应保存的长名单来源"},
+            "industry": {"op": "clear"},
+        })
+        expect("长名单混入缺失编号 400 且无处理数量",
+               s == 400 and "updated_count" not in d, (s, d))
+        expect("拒绝原因可读且指出缺失编号",
+               isinstance(d.get("error"), str) and bool(d["error"].strip())
+               and str(ghost) in d["error"], d)
+        s, d = req("GET", "/api/clients")
+        after_ghost = {c["id"]: c for c in d["clients"]}
+        expect("长名单混入缺失编号：所有客户保持提交前资料",
+               after_ghost == by_id)
+
+        # 37. 保存已经开始、尚未全部完成时出现数据库错误：通过触发器在后续
+        #     UPDATE 分块（名单最后一名）注入失败，应整次回滚——HTTP 400 +
+        #     可读的保存失败说明、不返回处理数量；重新读取客户列表不能出现
+        #     部分保存的内容。
+        fail_conn = sqlite3.connect(str(db_file))
+        fail_conn.execute(
+            "CREATE TRIGGER smoke_long_list_fail BEFORE UPDATE ON clients"
+            " WHEN OLD.id = %d"
+            " BEGIN SELECT RAISE(ABORT, 'smoke injected failure'); END"
+            % selected_ids[-1])
+        fail_conn.commit()
+        fail_conn.close()
+        s, d = batch_update(selected_ids, {
+            "source": {"op": "set", "value": "注入失败不应保存的来源"},
+            "industry": {"op": "clear"},
+        })
+        expect("保存中段数据库错误 400 且无处理数量",
+               s == 400 and "updated_count" not in d, (s, d))
+        expect("保存失败原因可读",
+               isinstance(d.get("error"), str) and "保存失败" in d["error"], d)
+        fail_conn = sqlite3.connect(str(db_file))
+        fail_conn.execute("DROP TRIGGER smoke_long_list_fail")
+        fail_conn.commit()
+        fail_conn.close()
+        s, d = req("GET", "/api/clients")
+        after_fail = {c["id"]: c for c in d["clients"]}
+        expect("数据库错误后无任何客户留下修改（无部分保存）",
+               after_fail == by_id)
+
+        # 38. 回滚后服务与数据库仍可用：小规模合法修改照常成功。
+        s, d = batch_update([seed_ids[0], seed_ids[1]],
+                            {"source": {"op": "set", "value": "回滚验证来源"}})
+        expect("回滚后小规模修改 200 处理 2 名",
+               s == 200 and d == {"updated_count": 2}, (s, d))
+        s, d = req("GET", "/api/clients")
+        final_by_id = {c["id"]: c for c in d["clients"]}
+        expect("回滚后修改正确落库、客户总数不变",
+               final_by_id[seed_ids[0]]["source"] == "回滚验证来源"
+               and final_by_id[seed_ids[1]]["source"] == "回滚验证来源"
+               and len(d["clients"]) == pre_seed_total + seed_count,
+               (final_by_id[seed_ids[0]], final_by_id[seed_ids[1]]))
     finally:
         proc.terminate()
         proc.wait(timeout=5)
