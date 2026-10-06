@@ -32,6 +32,20 @@
  *    一律保留 HTTP 400 按无法确认处理：不展示原始 JSON、不显示数量、不声称
  *    回滚或整份拒绝，文件与旧表保留、不刷新列表、不自动重发。缺少 name
  *    表头、UTF-8 编码错误、引号结构损坏等真实文件级错误仍走明确拒绝。
+ * I. 导入回复尚未返回的等待期间：按钮保持「正在导入…」不可提交，等待提示保留、
+ *    原有客户仍可见；重复点击、回车等再次触发表单提交都不增加请求，也不把等待
+ *    提示换成成功或未选文件提示；期间可以另选文件或取消选择（文件名按当前选择
+ *    显示），但不解除等待，请求体始终锁定为第一次提交时的文件，后来选中的文件
+ *    不自动导入；结束后报告与新增客户只属于首份文件，文件选择保留结束时的状态
+ *    （不恢复提交时的旧选择）；取消选择后直接提交只提示先选择 CSV 文件、不发
+ *    请求，重新选择合法文件后能正常提交，上一次等待不留下不可提交状态。
+ * J. 首份文件缺少 name 表头被真实 HTTP 400 拒绝的等待期间另选了合法文件：拒绝
+ *    原因照常展示、原客户不变、不显示成功数量；后来的合法文件在结束后保留、不
+ *    自动导入，按钮恢复后由用户主动提交才使用它。
+ * K. 等待保护覆盖「成功报告已显示、导入后的列表读取仍在进行」这段窗口：按钮继续
+ *    不可提交，再次提交不增加请求、不替换已确认的报告；列表读取失败时保留报告
+ *    与此前显示的客户、说明列表暂未更新稍后刷新即可、无需重新导入，处理结束后
+ *    解除等待。
  */
 import {spawn} from "node:child_process";
 import {dirname, join} from "node:path";
@@ -149,8 +163,38 @@ async function openSession(browser, base, options = {}) {
     importOverride: null,
     // importAbort 为 true 时直接断开导入请求（模拟网络错误）
     importAbort: false,
+    // importHold 为 true 时挂起导入请求（既不应答也不转发），模拟导入回复尚未
+    // 返回；放行时 continue 发往真实后端，请求体仍以挂起前那次提交的文件为准。
+    importHold: false,
+    // listHold 为 true 时挂起客户列表读取（GET），用于覆盖报告已显示、但导入
+    // 后的列表读取仍在进行这段等待窗口。
+    listHold: false,
   };
   const counts = {importPosts: 0, listGets: 0};
+  // 被挂起的请求：{request}，放行时 continue 发往真实后端
+  const heldImports = [];
+  const heldLists = [];
+
+  // 在页面侧记录每次实际交给 fetch 的导入文件（文件名与文本内容）。请求拦截层
+  // 对以 File 流形式发出的 body 取不到 postData，而等待保护要核对「后来另选的
+  // 文件不能被当成第一次提交的内容」，故在 fetch 边界留一份只读记录：
+  // Blob.text() 读取的是文件快照，不消耗真正发给后端的那份 body。
+  await page.evaluateOnNewDocument(() => {
+    window.__sentImportBodies = [];
+    const origFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const url = input && input.url ? input.url : String(input);
+      if (url.includes("/api/clients/import") && init && init.body instanceof Blob) {
+        const file = init.body;
+        window.__sentImportBodies.push({
+          name: file.name != null ? String(file.name) : "",
+          size: file.size,
+          textPromise: file.text(),
+        });
+      }
+      return origFetch(input, init);
+    };
+  });
 
   // options.importReadFailStatus：让导入请求拿到该状态码，但回复体由一个
   // 在读取时即失败的 ReadableStream 承载——res.status 可读而 res.text()
@@ -181,6 +225,7 @@ async function openSession(browser, base, options = {}) {
     const url = request.url();
     if (request.method() === "GET" && url.endsWith("/api/clients")) {
       counts.listGets += 1;
+      if (modes.listHold) { heldLists.push({request}); return; }
       if (modes.list === "close") { request.abort("failed"); return; }
       if (modes.list === "500") {
         request.respond({status: 500, contentType: "application/json; charset=utf-8",
@@ -202,6 +247,13 @@ async function openSession(browser, base, options = {}) {
     }
     if (request.method() === "POST" && url.endsWith("/api/clients/import")) {
       counts.importPosts += 1;
+      if (modes.importHold) {
+        // File 以流的形式作为 fetch body 时，拦截层拿不到请求体（postData 与
+        // fetchPostData 均为空）；页面侧另装的 __sentImportBodies 记录了 JS
+        // 实际交给 fetch 的文件与内容，用于核对请求锁定在哪一次提交上。
+        heldImports.push({request});
+        return;
+      }
       if (modes.importAbort) { request.abort("failed"); return; }
       if (modes.importOverride) {
         const {status, body, contentType} = modes.importOverride;
@@ -218,7 +270,7 @@ async function openSession(browser, base, options = {}) {
 
   await page.setCacheEnabled(false);
   await page.goto(base + "/", {waitUntil: "networkidle0"});
-  return {page, modes, counts};
+  return {page, modes, counts, heldImports, heldLists};
 }
 
 // 读取导入区域与客户列表的全部可见状态
@@ -278,6 +330,90 @@ async function submitImport(session) {
     {timeout: 5000});
   await new Promise(r => setTimeout(r, 80)); // 让横幅/列表渲染稳定
   return before;
+}
+
+// 点击导入但挂起请求：返回后页面正处于「已发出请求、尚未取得导入回复」的等待中。
+async function submitImportHeld(session) {
+  const {page, modes} = session;
+  modes.importHold = true;
+  await page.click("#submit-btn");
+  const held = await waitForHeldImport(session);
+  await page.waitForFunction(
+    () => document.getElementById("submit-btn").textContent === "正在导入…" &&
+      document.getElementById("submit-btn").disabled,
+    {timeout: 5000});
+  await page.waitForSelector("#report .banner.busy", {timeout: 5000});
+  return held;
+}
+
+async function waitForHeldImport(session, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (session.heldImports.length > 0) return session.heldImports[0];
+    await new Promise(r => setTimeout(r, 25));
+  }
+  throw new Error("导入请求未在限定时间内发出");
+}
+
+async function waitForHeldList(session, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (session.heldLists.length > 0) return session.heldLists[0];
+    await new Promise(r => setTimeout(r, 25));
+  }
+  throw new Error("导入后的列表读取未在限定时间内发出");
+}
+
+function releaseHeldImport(session) {
+  const h = session.heldImports.shift();
+  if (!h) throw new Error("没有挂起中的导入请求");
+  session.modes.importHold = false;
+  h.request.continue();
+}
+
+function releaseHeldList(session) {
+  const h = session.heldLists.shift();
+  if (!h) throw new Error("没有挂起中的列表读取");
+  session.modes.listHold = false;
+  h.request.continue();
+}
+
+// 等待本次导入的全部结果处理（含随后的列表读取）结束：按钮恢复「导入」并可用。
+async function waitImportDone(page) {
+  await page.waitForFunction(
+    () => document.getElementById("submit-btn").textContent === "导入" &&
+      !document.getElementById("submit-btn").disabled,
+    {timeout: 8000});
+  await new Promise(r => setTimeout(r, 80));
+}
+
+// 通过表单提交路径尝试再次提交（按钮禁用时的重复点击、回车触发的提交都在这里）：
+// requestSubmit 在提交按钮禁用时不会派发 submit，手工派发的 submit 事件则会进入
+// 监听器——等待保护必须在监听器入口直接忽略，两种路径都不能新增请求。
+async function tryImportResubmit(page) {
+  await page.evaluate(() => {
+    const form = document.getElementById("import-form");
+    form.requestSubmit();
+    form.dispatchEvent(new Event("submit", {cancelable: true}));
+  });
+  await page.focus("#submit-btn");
+  await page.keyboard.press("Enter");
+  await new Promise(r => setTimeout(r, 150)); // 给潜在的错误请求留出发出时间
+}
+
+// 清空文件选择（取消选择）：file input 允许上传空文件列表来复位
+async function clearFileInput(page) {
+  await page.$("#file-input").then(input => input.uploadFile());
+  await page.waitForFunction(() => document.getElementById("file-input").files.length === 0 &&
+    document.getElementById("filename").textContent === "");
+}
+
+// 读取页面侧记录的、实际交给 fetch 的导入文件（按发出顺序）
+async function sentImportBodies(page) {
+  return page.evaluate(async () =>
+    Promise.all((window.__sentImportBodies || []).map(async b => ({
+      name: b.name, size: b.size, text: await b.textPromise,
+    }))));
 }
 
 // ---- 报告口径断言 ----------------------------------------------------------
@@ -1130,6 +1266,376 @@ async function run() {
       check("H 收尾：所有被拦截/文件级错误的导入都未新增客户，后端仍是原来的一名",
         real.clients.length === 1 && real.clients[0].name === "四百前已有客户",
         real.clients.map(x => x.name));
+    }
+
+    // ===================================================================
+    // 场景 I：导入回复尚未返回的等待期间——只能提交一次，内容以第一次提交的
+    //         文件为准；等待期间另选/取消文件只改变当前选择显示，不新增请求、
+    //         不改变本次内容；结束后保留结束时的选择（取消后的未选状态）。
+    // ===================================================================
+    {
+      const server = await startServer("import-pending");
+      servers.push(server);
+      const {base} = server;
+      await seed(base, ["等待前已有客户"]);
+
+      const session = await openSession(browser, base);
+      const {page, modes, counts} = session;
+
+      const firstCsv = buildCsv(["name", "source", "important_date"], [
+        ["首份客户甲", "展会", "2024-01-01"],
+        ["首份客户乙", "网络", "2024-05-05"],
+      ]);
+      const laterCsv = buildCsv(["name"], [["后来客户丙"]]);
+      await uploadCsv(page, "first.csv", firstCsv);
+
+      // 挂起导入请求：服务尚未给出导入回复
+      await submitImportHeld(session);
+      const waiting = await importSnap(page);
+
+      check("I 等待中：按钮显示「正在导入…」且不可点击",
+        waiting.submitText === "正在导入…" && waiting.submitDisabled,
+        {text: waiting.submitText, disabled: waiting.submitDisabled});
+      check("I 等待中：只显示等待提示，不显示成功数量或拒绝/未选文件提示",
+        waiting.banners.length === 1 && waiting.banners[0].cls.includes("busy") &&
+        waiting.banners[0].text.includes("正在导入") &&
+        !/新增\s*\d+\s*条|拒绝|请先选择 CSV/.test(waiting.reportText),
+        waiting.banners);
+      check("I 等待中：原有客户仍可见、不被清空",
+        waiting.rows.length === 1 && waiting.rows[0].cells[0] === "等待前已有客户",
+        waiting.rows.map(r => r.cells[0]));
+      check("I 等待中：挂起的请求只有 1 个，请求体锁定为第一次提交的文件",
+        counts.importPosts === 1 && session.heldImports.length === 1 &&
+        (await sentImportBodies(page)).length === 1 &&
+        (await sentImportBodies(page))[0].text === firstCsv,
+        {posts: counts.importPosts, sent: await sentImportBodies(page)});
+
+      // 等待期间重复点击、回车等路径再次触发表单提交：不能增加请求，
+      // 也不能把等待提示改成成功或「请先选择 CSV 文件」。
+      await tryImportResubmit(page);
+      check("I 等待中：再次触发表单提交不增加导入请求（仍只有挂起的 1 个）",
+        counts.importPosts === 1 && session.heldImports.length === 1,
+        `posts=${counts.importPosts}`);
+      const afterResubmit = await importSnap(page);
+      check("I 等待中：重复提交后仍是等待提示，未变成成功或未选文件提示",
+        afterResubmit.banners.length === 1 &&
+        afterResubmit.banners[0].cls.includes("busy") &&
+        !/新增\s*\d+\s*条|拒绝|请先选择 CSV/.test(afterResubmit.reportText),
+        afterResubmit.banners);
+
+      // 等待期间另选文件：文件名称按当前选择显示，但按钮仍处于等待状态，
+      // 本次发送的内容不受后来选择影响，后来的文件不自动导入。
+      await uploadCsv(page, "later.csv", laterCsv);
+      const switched = await importSnap(page);
+      check("I 等待中：另选文件后文件名按当前选择显示",
+        switched.fileCount === 1 && switched.filename === "later.csv",
+        {count: switched.fileCount, filename: switched.filename});
+      check("I 等待中：另选文件不解除等待状态、不新增请求",
+        switched.submitText === "正在导入…" && switched.submitDisabled &&
+        counts.importPosts === 1 && session.heldImports.length === 1,
+        {text: switched.submitText, disabled: switched.submitDisabled,
+          posts: counts.importPosts});
+      check("I 等待中：挂起请求体仍是首次文件，后来选中的文件不会被当成本次内容",
+        (await sentImportBodies(page)).length === 1 &&
+        (await sentImportBodies(page))[0].text === firstCsv &&
+        (await sentImportBodies(page))[0].text !== laterCsv,
+        "body mismatch");
+      await tryImportResubmit(page);
+      check("I 等待中：另选文件后再次提交仍不增加请求",
+        counts.importPosts === 1, `posts=${counts.importPosts}`);
+
+      // 等待期间取消选择：文件名清空，但等待状态与请求都不变
+      await clearFileInput(page);
+      const canceled = await importSnap(page);
+      check("I 等待中：取消选择后文件名为空、无选中文件",
+        canceled.fileCount === 0 && canceled.filename === "",
+        {count: canceled.fileCount, filename: canceled.filename});
+      check("I 等待中：取消选择不解除等待状态、不新增请求、等待提示不变",
+        canceled.submitText === "正在导入…" && canceled.submitDisabled &&
+        counts.importPosts === 1 &&
+        canceled.banners.length === 1 && canceled.banners[0].cls.includes("busy") &&
+        !canceled.reportText.includes("请先选择 CSV"),
+        {text: canceled.submitText, disabled: canceled.submitDisabled,
+          posts: counts.importPosts, banners: canceled.banners});
+
+      // 放行挂起的导入请求，走真实后端
+      releaseHeldImport(session);
+      await waitImportDone(page);
+      const done = await importSnap(page);
+
+      check("I 结果返回：按首份文件显示新增 2 条、未导入 0 条",
+        successBanner(done, 2, 0), done.banners);
+      check("I 结果返回：列表只新增首份文件实际导入的两名客户，后来选中的文件不自动导入",
+        done.rows.length === 3 &&
+        done.rows.some(r => r.cells[0] === "首份客户甲") &&
+        done.rows.some(r => r.cells[0] === "首份客户乙") &&
+        !done.rows.some(r => r.cells[0] === "后来客户丙"),
+        done.rows.map(r => r.cells[0]));
+      check("I 结果返回：保留结果处理结束时的文件选择——取消后的未选状态，不恢复旧选择",
+        !done.submitDisabled && done.submitText === "导入" &&
+        done.fileCount === 0 && done.filename === "",
+        {disabled: done.submitDisabled, text: done.submitText,
+          count: done.fileCount, filename: done.filename});
+      check("I 结果返回：全程仅 1 次导入请求，后来选中的文件没有被自动补交",
+        counts.importPosts === 1, `posts=${counts.importPosts}`);
+
+      const realI = await listClients(base);
+      check("I 结果返回：后端确为首份文件的两名新客户落库、后来客户未落库",
+        realI.clients.length === 3 &&
+        realI.clients.some(x => x.name === "首份客户甲") &&
+        realI.clients.some(x => x.name === "首份客户乙") &&
+        !realI.clients.some(x => x.name === "后来客户丙"),
+        realI.clients.map(x => x.name));
+
+      // 等待时取消了选择：结束后直接提交只提示先选择 CSV 文件，不发送请求
+      await page.click("#submit-btn");
+      await new Promise(r => setTimeout(r, 80));
+      const noFile = await importSnap(page);
+      check("I 结束后未选文件直接提交：只提示先选择 CSV 文件、按钮可用",
+        noFile.banners.length === 1 && noFile.banners[0].cls.includes("bad") &&
+        noFile.reportText.includes("请先选择 CSV 文件") &&
+        !noFile.submitDisabled && noFile.submitText === "导入",
+        noFile.banners);
+      check("I 结束后未选文件直接提交：不发送导入请求",
+        counts.importPosts === 1, `posts=${counts.importPosts}`);
+
+      // 重新选择合法文件后能够正常提交，不能因上一次等待留下不可提交状态
+      await uploadCsv(page, "later.csv", laterCsv);
+      await submitImport(session);
+      const second = await importSnap(page);
+      check("I 重新选择后主动提交：后来的合法文件正常导入（新增 1 条）",
+        successBanner(second, 1, 0) &&
+        second.rows.some(r => r.cells[0] === "后来客户丙") &&
+        second.rows.length === 4,
+        {banners: second.banners, rows: second.rows.map(r => r.cells[0])});
+      check("I 重新选择后主动提交：这次由用户主动触发（全程累计 2 次请求）",
+        counts.importPosts === 2, `posts=${counts.importPosts}`);
+      const realI2 = await listClients(base);
+      check("I 收尾：后端共四名客户，等待保护没有造成漏导或误导",
+        realI2.clients.length === 4 &&
+        realI2.clients.some(x => x.name === "后来客户丙"),
+        realI2.clients.map(x => x.name));
+      await page.close();
+    }
+
+    // ===================================================================
+    // 场景 J：首份文件缺少 name 表头被真实 HTTP 400 拒绝——等待期间后来选中的
+    //         合法文件在结束后保留，按钮恢复后由用户主动提交才导入。
+    // ===================================================================
+    {
+      const server = await startServer("import-reject-pending");
+      servers.push(server);
+      const {base} = server;
+      await seed(base, ["拒绝前已有客户"]);
+
+      const session = await openSession(browser, base);
+      const {page, counts} = session;
+
+      const badCsv = "source,region\n展会,华东\n";
+      const validCsv = buildCsv(["name"], [["等待后合法客户"]]);
+      await uploadCsv(page, "no-name.csv", badCsv);
+
+      await submitImportHeld(session);
+      // 等待期间另选一份合法文件
+      await uploadCsv(page, "later-valid.csv", validCsv);
+      const switched = await importSnap(page);
+      check("J 等待中：文件名显示后来另选的合法文件、按钮仍等待、请求仍只有 1 个",
+        switched.filename === "later-valid.csv" && switched.fileCount === 1 &&
+        switched.submitText === "正在导入…" && switched.submitDisabled &&
+        counts.importPosts === 1,
+        {filename: switched.filename, text: switched.submitText,
+          disabled: switched.submitDisabled, posts: counts.importPosts});
+      check("J 等待中：挂起请求体是缺少 name 的首份文件，不是后来的合法文件",
+        (await sentImportBodies(page)).length === 1 &&
+        (await sentImportBodies(page))[0].name === "no-name.csv" &&
+        (await sentImportBodies(page))[0].text === badCsv &&
+        (await sentImportBodies(page))[0].text !== validCsv,
+        "body mismatch");
+
+      releaseHeldImport(session);
+      await waitImportDone(page);
+      const rejected = await importSnap(page);
+
+      check("J 拒绝：展示整份文件已拒绝、本次没有新增客户、原有资料保持原样与原因",
+        rejected.banners.length === 1 && rejected.banners[0].cls.includes("bad") &&
+        rejected.reportText.includes("整份文件已拒绝导入") &&
+        rejected.reportText.includes("本次没有新增客户") &&
+        rejected.reportText.includes("原有客户资料保持原样") &&
+        rejected.reportText.includes("name"),
+        rejected.banners);
+      check("J 拒绝：不显示成功数量",
+        !/新增\s*\d+\s*条/.test(rejected.reportText), rejected.reportText);
+      check("J 拒绝：原客户资料不变（仍是拒绝前的一名客户）",
+        rejected.rows.length === 1 && rejected.rows[0].cells[0] === "拒绝前已有客户",
+        rejected.rows.map(r => r.cells[0]));
+      check("J 拒绝：等待期间后来选中的合法文件仍保留，不恢复提交时的旧选择",
+        !rejected.submitDisabled && rejected.submitText === "导入" &&
+        rejected.fileCount === 1 && rejected.filename === "later-valid.csv",
+        {disabled: rejected.submitDisabled, count: rejected.fileCount,
+          filename: rejected.filename});
+      check("J 拒绝：后来的合法文件没有被自动导入（全程仅 1 次请求）",
+        counts.importPosts === 1, `posts=${counts.importPosts}`);
+      const realJ = await listClients(base);
+      check("J 拒绝：后端仍只有拒绝前的一名客户",
+        realJ.clients.length === 1 && realJ.clients[0].name === "拒绝前已有客户",
+        realJ.clients.map(x => x.name));
+
+      // 按钮恢复后由用户主动提交：使用当时保留的合法文件，正常导入
+      await submitImport(session);
+      const fixed = await importSnap(page);
+      check("J 主动再提交：保留的合法文件正常导入（新增 1 条），列表刷新为两名客户",
+        successBanner(fixed, 1, 0) &&
+        fixed.rows.some(r => r.cells[0] === "等待后合法客户") && fixed.rows.length === 2,
+        {banners: fixed.banners, rows: fixed.rows.map(r => r.cells[0])});
+      check("J 主动再提交：由用户主动触发（累计 2 次请求）",
+        counts.importPosts === 2, `posts=${counts.importPosts}`);
+      const realJ2 = await listClients(base);
+      check("J 收尾：后端两名客户，首份坏文件未污染数据",
+        realJ2.clients.length === 2 &&
+        realJ2.clients.some(x => x.name === "等待后合法客户"),
+        realJ2.clients.map(x => x.name));
+      await page.close();
+    }
+
+    // ===================================================================
+    // 场景 K：成功报告已经显示、但导入后的客户列表仍在读取这段窗口——按钮继续
+    //         不可提交，再次提交不增加请求；列表读取失败时保留已确认的报告与
+    //         此前显示的客户，处理结束后解除等待。
+    // ===================================================================
+    {
+      const server = await startServer("import-list-pending");
+      servers.push(server);
+      const {base} = server;
+      await seed(base, ["列表前客户甲"]);
+
+      // K1：挂起导入后的列表读取，验证「报告已确认、列表仍在读取」窗口的保护
+      {
+        const session = await openSession(browser, base);
+        const {page, modes, counts} = session;
+        await uploadCsv(page, "list-pending.csv", buildCsv(["name"], [["列表新客乙"]]));
+
+        modes.listHold = true;
+        await page.click("#submit-btn");
+        // 等到导入回复已处理、成功报告已显示，随后的列表读取被挂起
+        await waitForHeldList(session);
+        await page.waitForSelector("#report .banner.ok", {timeout: 5000});
+        const mid = await importSnap(page);
+
+        check("K1 列表读取中：已确认的成功报告先显示（新增 1 条）",
+          successBanner(mid, 1, 0), mid.banners);
+        check("K1 列表读取中：按钮继续不可提交、文案仍是「正在导入…」",
+          mid.submitText === "正在导入…" && mid.submitDisabled,
+          {text: mid.submitText, disabled: mid.submitDisabled});
+        check("K1 列表读取中：此前显示的客户仍可见、不被清空、不显示空列表提示",
+          mid.rows.length === 1 && mid.rows[0].cells[0] === "列表前客户甲" &&
+          !mid.emptyOn && !mid.loadErrorOn,
+          {rows: mid.rows.map(r => r.cells[0]), empty: mid.emptyOn});
+        check("K1 列表读取中：导入请求只发出 1 次、列表读取挂起 1 个",
+          counts.importPosts === 1 && session.heldLists.length === 1,
+          {posts: counts.importPosts, held: session.heldLists.length});
+
+        // 这段窗口再次提交也不能增加请求、不能替换已确认的报告
+        await tryImportResubmit(page);
+        check("K1 列表读取中：再次提交不增加导入请求",
+          counts.importPosts === 1 && session.heldImports.length === 0,
+          `posts=${counts.importPosts}`);
+        const mid2 = await importSnap(page);
+        check("K1 列表读取中：成功报告不被替换成等待/未选文件提示，按钮仍不可提交",
+          successBanner(mid2, 1, 0) &&
+          mid2.banners.length === 1 && mid2.banners[0].cls.includes("ok") &&
+          mid2.submitText === "正在导入…" && mid2.submitDisabled,
+          {banners: mid2.banners, text: mid2.submitText});
+
+        // 这段窗口里另选文件同样不解除等待、不新增请求；结束后保留后来的选择，
+        // 而不是恢复提交时的旧选择，后来的文件也不自动导入。
+        await uploadCsv(page, "later-kept.csv", buildCsv(["name"], [["窗口后另选客户"]]));
+        const switched = await importSnap(page);
+        check("K1 列表读取中：窗口内另选文件只更新当前选择显示、按钮仍不可提交、不新增请求",
+          switched.fileCount === 1 && switched.filename === "later-kept.csv" &&
+          switched.submitDisabled && switched.submitText === "正在导入…" &&
+          counts.importPosts === 1,
+          {filename: switched.filename, posts: counts.importPosts});
+
+        releaseHeldList(session);
+        await waitImportDone(page);
+        const done = await importSnap(page);
+        check("K1 列表读取完成：列表刷新为两名客户、按钮恢复可用",
+          done.rows.length === 2 &&
+          done.rows.some(r => r.cells[0] === "列表新客乙") &&
+          !done.submitDisabled && done.submitText === "导入" &&
+          !done.loadErrorOn,
+          {rows: done.rows.map(r => r.cells[0]), text: done.submitText});
+        check("K1 列表读取完成：保留结束时后来另选的文件（不恢复提交时的旧选择、不自动导入它）",
+          done.fileCount === 1 && done.filename === "later-kept.csv" &&
+          !done.rows.some(r => r.cells[0] === "窗口后另选客户"),
+          {count: done.fileCount, filename: done.filename,
+            rows: done.rows.map(r => r.cells[0])});
+        check("K1 列表读取完成：全程仅 1 次导入请求",
+          counts.importPosts === 1, `posts=${counts.importPosts}`);
+        await page.close();
+      }
+
+      // K2：同一窗口里列表读取最终失败——保留已确认报告与旧客户行，附加稍后
+      //     刷新提示，无需重新导入；处理结束后解除等待，按钮恢复可提交。
+      {
+        const session = await openSession(browser, base);
+        const {page, modes, counts} = session;
+        await uploadCsv(page, "list-fail.csv", buildCsv(["name"], [["列表失败新客丙"]]));
+
+        modes.listHold = true;
+        await page.click("#submit-btn");
+        await waitForHeldList(session);
+        await page.waitForSelector("#report .banner.ok", {timeout: 5000});
+        const mid = await importSnap(page);
+        check("K2 列表读取失败前：成功报告已确认（新增 1 条）、按钮不可提交",
+          successBanner(mid, 1, 0) && mid.submitDisabled &&
+          mid.rows.some(r => r.cells[0] === "列表前客户甲") &&
+          mid.rows.some(r => r.cells[0] === "列表新客乙") &&
+          mid.rows.length === 2,
+          {banners: mid.banners, rows: mid.rows.map(r => r.cells[0])});
+
+        await tryImportResubmit(page);
+        check("K2 读取中再次提交：不增加导入请求",
+          counts.importPosts === 1, `posts=${counts.importPosts}`);
+
+        // 让挂起的列表读取以连接失败结束
+        modes.listHold = false;
+        session.heldLists.shift().request.abort("failed");
+        await waitImportDone(page);
+        const failed = await importSnap(page);
+
+        check("K2 列表读取失败：已确认的报告数量保留（仍显示新增 1 条）",
+          successBanner(failed, 1, 0), failed.banners);
+        check("K2 列表读取失败：附加列表暂未更新、稍后刷新即可、无需重新导入的提示",
+          failed.banners.some(b => b.cls.includes("warn") &&
+            b.text.includes("导入后读取客户列表失败") &&
+            b.text.includes("列表暂未更新") &&
+            /稍后.*刷新/.test(b.text) &&
+            b.text.includes("无需重新导入")),
+          failed.banners);
+        check("K2 列表读取失败：此前显示的客户行全部保留、不被清空、不显示空列表提示",
+          failed.rows.length === 2 &&
+          failed.rows.some(r => r.cells[0] === "列表前客户甲") &&
+          failed.rows.some(r => r.cells[0] === "列表新客乙") &&
+          !failed.rows.some(r => r.cells[0] === "列表失败新客丙") &&
+          !failed.emptyOn,
+          failed.rows.map(r => r.cells[0]));
+        check("K2 列表读取失败：处理结束解除等待，按钮恢复「导入」并可提交",
+          !failed.submitDisabled && failed.submitText === "导入" &&
+          failed.fileCount === 1 && failed.filename === "list-fail.csv",
+          {disabled: failed.submitDisabled, text: failed.submitText,
+            count: failed.fileCount, filename: failed.filename});
+        check("K2 列表读取失败：不自动重发导入（全程仅 1 次导入请求）",
+          counts.importPosts === 1, `posts=${counts.importPosts}`);
+
+        // 后端实际上已落库列表失败新客丙——稍后刷新即可看到，无需重新导入
+        const realK = await listClients(base);
+        check("K2 收尾：导入本身已成功落库（共三名客户，含读取失败时未显示的新客丙）",
+          realK.clients.length === 3 &&
+          realK.clients.some(x => x.name === "列表失败新客丙"),
+          realK.clients.map(x => x.name));
+        await page.close();
+      }
     }
 
     await browser.close();
