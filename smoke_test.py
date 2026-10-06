@@ -759,6 +759,69 @@ def main():
                 expect("整次拒绝不写入任何客户：" + label,
                        req("GET", "/api/clients")[1] == id_snapshot)
 
+        # 31b. 超过编号可表示范围的整数（如 9223372036854775808）：无论单独出现还是
+        #      与实际存在的编号混在一起、排在数组开头还是末尾，都整次拒绝（HTTP 400），
+        #      原因非空可读、说明超出可接受范围并指出该编号；不能缩小、截断或转成别的
+        #      编号后继续处理，合法字段修改也不允许先保存。
+        oversized_ids = [
+            ("上限加一", 9223372036854775808),
+            ("远超上限", 10 ** 30),
+        ]
+        for value_label, big in oversized_ids:
+            for order_label, ids in (
+                ("单独出现", [big]),
+                ("过大编号在合法编号之前", [big, id_g, id_h]),
+                ("过大编号在合法编号之后", [id_g, id_h, big]),
+            ):
+                label = "%s（%s）" % (value_label, order_label)
+                s, d = batch_update(ids, id_legal_updates)
+                expect("过大编号 400：" + label,
+                       s == 400 and "updated_count" not in d, (s, d, big))
+                expect("原因非空可读、说明超出范围并指出该编号：" + label,
+                       isinstance(d.get("error"), str) and bool(d["error"].strip())
+                       and "超出" in d["error"] and str(big) in d["error"], d)
+                expect("过大编号整次拒绝不写入任何客户：" + label,
+                       req("GET", "/api/clients")[1] == id_snapshot)
+
+        # 31c. 上限本身（9223372036854775807）仍是可接受的整数编号：没有对应客户时
+        #      按找不到客户的现有规则拒绝，不能误报编号超出范围。
+        s, d = batch_update([id_g, 9223372036854775807], id_legal_updates)
+        expect("上限编号按找不到客户拒绝 400",
+               s == 400 and "updated_count" not in d, (s, d))
+        expect("上限编号原因是找不到客户而非超出范围",
+               isinstance(d.get("error"), str) and "找不到" in d["error"]
+               and "9223372036854775807" in d["error"]
+               and "超出" not in d["error"], d)
+        expect("上限编号拒绝整次不写入",
+               req("GET", "/api/clients")[1] == id_snapshot)
+
+        # 31d. 移除过大编号、只保留实际存在的客户后再次提交，原先有效的修改正常生效。
+        s, d = batch_update([id_g, id_h], id_legal_updates)
+        expect("移除过大编号后 200 处理 2 名", s == 200 and d == {"updated_count": 2}, (s, d))
+        expect("移除后来源写入、行业清空",
+               client_by_id(id_g)["source"] == "不应保存的编号来源"
+               and client_by_id(id_h)["source"] == "不应保存的编号来源"
+               and client_by_id(id_g)["industry"] is None
+               and client_by_id(id_h)["industry"] is None,
+               (client_by_id(id_g), client_by_id(id_h)))
+        expect("移除后未选中客户不受影响",
+               client_by_id(id_i) == before_i and client_by_id(id_j) == before_j,
+               (client_by_id(id_i), client_by_id(id_j)))
+        # 还原号测甲/号测乙资料，供后续逐客户核对沿用原快照。
+        s, d = batch_update([id_g, id_h], {
+            "source": {"op": "set", "value": "sA"},
+            "industry": {"op": "set", "value": "iA"},
+        })
+        expect("还原号测甲来源与行业", s == 200, (s, d))
+        s, d = batch_update([id_h], {
+            "source": {"op": "set", "value": "sB"},
+            "industry": {"op": "set", "value": "iB"},
+        })
+        expect("还原号测乙来源与行业", s == 200, (s, d))
+        expect("还原后号测甲乙回到原值",
+               client_by_id(id_g) == before_g and client_by_id(id_h) == before_h,
+               (client_by_id(id_g), client_by_id(id_h)))
+
         # 全部拒绝后逐客户核对：选中客户的来源、地区、行业与重要日期分别保持自己的
         # 原值（原本为空的仍为空），不能被统一成其中一名客户的内容；编号、名称、
         # 客户总数与未选中客户都不变，也不表示部分客户已修改。

@@ -636,6 +636,10 @@ FIELD_LABELS = {
     "important_date": "重要日期",
 }
 
+# 客户编号上限：SQLite INTEGER 可表示的最大值。超过它的整数即使能解析为 JSON
+# 也不能作为客户编号——不能缩小、截断或转换后继续处理，必须整次拒绝。
+MAX_CLIENT_ID = 9223372036854775807
+
 
 def _normalize_set_value(field_name, value):
     """校验 set 操作的值并返回最终入库值；非法时抛 BatchUpdateError。
@@ -674,6 +678,9 @@ def batch_update_clients(database, payload):
     for raw_id in raw_ids:
         if isinstance(raw_id, bool) or not isinstance(raw_id, int) or raw_id <= 0:
             raise BatchUpdateError("客户编号必须是正整数：%r 不合法" % (raw_id,))
+        if raw_id > MAX_CLIENT_ID:
+            raise BatchUpdateError(
+                "客户编号超出可接受范围（1 到 %d）：%d" % (MAX_CLIENT_ID, raw_id))
         if raw_id not in seen_ids:
             seen_ids.add(raw_id)
             ids.append(raw_id)
