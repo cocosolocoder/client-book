@@ -79,7 +79,9 @@ th{font-size:.85rem;color:#5b6b7b;font-weight:600}
 <section class="card">
 <h2>从 CSV 导入客户</h2>
 <form id="import-form">
-  <input type="file" id="file-input" accept=".csv,text/csv,text/plain" required>
+  <!-- 不使用原生 required 拦截：未选文件时由提交处理统一在页内提示先选择 CSV，
+       与批量修改表单的自定义校验提示口径一致，避免原生气泡拦截后页内无提示。 -->
+  <input type="file" id="file-input" accept=".csv,text/csv,text/plain">
   <span class="filename" id="filename"></span>
   <div style="margin-top:.75rem"><button type="submit" id="submit-btn">导入</button></div>
 </form>
@@ -130,11 +132,21 @@ const selected = new Set();
 // 一次批量保存从发出到本次结果处理结束期间为 true：期间只能有这一次请求，
 // 勾选变化与表单重复提交都不能解除或新增请求。
 let batchSaving = false;
+// 一次 CSV 导入从提交文件开始，到回复读取、结果展示以及该结果需要的客户列表
+// 刷新全部结束期间为 true：期间只能有最初发出的那一次导入请求；重复点击、
+// 回车等再次触发表单提交都直接忽略，不解除等待、不新增请求、不更换提示。
+let importing = false;
 
 function syncSubmitState() {
   const btn = document.getElementById("batch-submit");
   btn.disabled = batchSaving || selected.size === 0;
   btn.textContent = batchSaving ? "正在保存…" : "保存修改";
+}
+
+function syncImportState() {
+  const btn = document.getElementById("submit-btn");
+  btn.disabled = importing;
+  btn.textContent = importing ? "正在导入…" : "导入";
 }
 
 async function loadClients() {
@@ -526,17 +538,26 @@ function unreliableReportHtml(prefix) {
 document.getElementById("import-form").addEventListener("submit", async e => {
   e.preventDefault();
   const input = document.getElementById("file-input");
+  // 等待结果期间再次提交（重复点击、回车触发的表单提交等）一律忽略：
+  // 不增加请求、不提前解除等待，也不把「正在导入」换成成功、失败或未选文件
+  // 的提示。等待期间更换/取消文件选择不影响这一判断：本次请求固化在提交时
+  // 读取到的那份文件上，后来的选择既不被自动补交，也不会改变正在进行的请求。
+  if (importing) return;
   const file = input.files[0];
-  const btn = document.getElementById("submit-btn");
   if (!file) {
     showReport('<div class="banner bad">请先选择 CSV 文件。</div>');
     return;
   }
-  btn.disabled = true;
+  // 以本次提交时选中的文件为准，固化请求内容；等待期间另选或取消选择都不
+  // 影响本次请求，回复也只说明这份文件的结果。
+  const submittedFile = file;
+  importing = true;
+  syncImportState();
+  showReport('<div class="banner busy">正在导入，请勿重复提交…</div>');
   try {
     let res;
     try {
-      res = await fetch("/api/clients/import", {method: "POST", body: file});
+      res = await fetch("/api/clients/import", {method: "POST", body: submittedFile});
     } catch (netErr) {
       // 请求未拿到任何回复：不知道服务是否处理过文件，不能声称资料未变。
       showReport(unreliableReportHtml("导入请求失败（" + esc(netErr.message) + "）："));
@@ -607,8 +628,11 @@ document.getElementById("import-form").addEventListener("submit", async e => {
   } catch (err) {
     showReport(unreliableReportHtml("导入处理出现意外问题（" + esc(err.message) + "）："));
   } finally {
-    // 无论结果如何都结束导入等待；不清空已选文件，由用户主动处理。
-    btn.disabled = false;
+    // 无论结果如何都结束导入等待：按钮恢复为「导入」并可用。不清空、不恢复
+    // 文件选择——保留用户当时的状态（期间另选的文件或取消后的未选状态），
+    // 是否能再次导入由下一次主动提交时是否选中文件决定，等待限制不会延续。
+    importing = false;
+    syncImportState();
   }
 });
 
