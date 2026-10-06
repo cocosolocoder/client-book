@@ -523,16 +523,37 @@ function unreliableReportHtml(prefix) {
     "不会清空客户、不会自动重新提交。</div>";
 }
 
+// 一次 CSV 导入从提交所选文件开始，到回复读取、结果展示以及该结果需要的客户列表
+// 刷新全部结束期间为 true：期间只能有这一次导入请求。重复提交（重复点击、回车触发
+// 的表单提交）一律直接忽略，不发新请求、不提前结束等待、不替换等待提示；等待期间
+// 用户仍可更换或取消已选文件，但已发出的请求固定使用本次提交时捕获的文件，
+// 回复也只说明这份文件，不把后来选择的文件算进来，也不自动补交。
+let importing = false;
+
+function syncImportState() {
+  const btn = document.getElementById("submit-btn");
+  btn.disabled = importing;
+  btn.textContent = importing ? "正在导入…" : "导入";
+}
+
 document.getElementById("import-form").addEventListener("submit", async e => {
   e.preventDefault();
+  // 等待期间的任何重复提交（含回车触发的表单提交）一律忽略：不发新请求、不提前
+  // 解除等待，也不把「正在导入」提示换成成功、失败或「请先选择 CSV」提示。
+  if (importing) return;
   const input = document.getElementById("file-input");
+  // 固化本次提交时选中的文件：等待期间更换或取消选择都不影响已发出的请求，
+  // 回复只说明这份文件的结果。
   const file = input.files[0];
-  const btn = document.getElementById("submit-btn");
   if (!file) {
     showReport('<div class="banner bad">请先选择 CSV 文件。</div>');
     return;
   }
-  btn.disabled = true;
+  importing = true;
+  syncImportState();
+  // 立即以「正在导入」提示替换上一份文件留下的报告，旧报告不能继续冒充本次结果；
+  // 此期间不清空、不隐藏当前客户表格，表格只在既有规则允许（已确认成功报告）时刷新。
+  showReport('<div class="banner busy">正在导入所选 CSV 文件，请勿重复提交…</div>');
   try {
     let res;
     try {
@@ -607,8 +628,14 @@ document.getElementById("import-form").addEventListener("submit", async e => {
   } catch (err) {
     showReport(unreliableReportHtml("导入处理出现意外问题（" + esc(err.message) + "）："));
   } finally {
-    // 无论结果如何都结束导入等待；不清空已选文件，由用户主动处理。
-    btn.disabled = false;
+    // 无论本次结果属于哪一种（成功、部分成功、明确拒绝、无法确认或读取失败），
+    // 处理结束后都解除等待：按钮恢复为「导入」。文件选择保留用户当时的状态——
+    // 等待期间换过文件就保留后来选的文件、取消选择就保持未选，不恢复最初文件；
+    // 用户随后主动提交时使用当时选中的文件，没有文件则只提示先选择 CSV、不发请求。
+    // 等待期间的提交限制只针对进行中的这一次，上一轮结束后仍可再次主动导入，
+    // 重复客户继续按现有规则跳过。
+    importing = false;
+    syncImportState();
   }
 });
 
