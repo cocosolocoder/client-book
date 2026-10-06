@@ -640,6 +640,10 @@ FIELD_LABELS = {
 # 超过它的整数无法作为编号保存或查询，必须在进入数据库前明确拒绝。
 MAX_CLIENT_ID = 9223372036854775807
 
+# 单条 SQL 语句中 IN (...) 一次容纳的客户编号数量。SQLite 对单条语句的
+# 绑定参数数量有限制（不同版本至少保证 999），按此分块可支持任意多的选中客户。
+ID_QUERY_CHUNK = 500
+
 
 def _normalize_set_value(field_name, value):
     """校验 set 操作的值并返回最终入库值；非法时抛 BatchUpdateError。
@@ -712,23 +716,35 @@ def batch_update_clients(database, payload):
     if not actions:
         raise BatchUpdateError("全部字段均保持原值：请至少选择一个字段进行设置或清空")
 
-    placeholders = ",".join("?" for _ in ids)
-    existing = {
-        row[0]
-        for row in database.execute(
-            "SELECT id FROM clients WHERE id IN (%s)" % placeholders, ids
+    # SQLite 单条语句可绑定的参数数量有限（至少 999），选中客户较多时
+    # 一条 IN (...) 放不下全部编号。按块拆分查询与更新，块间处于同一事务，
+    # 任一块失败都整体回滚，保证大量选择仍是一笔整体修改。
+    def chunks(values, size):
+        for start in range(0, len(values), size):
+            yield values[start:start + size]
+
+    existing = set()
+    for group in chunks(ids, ID_QUERY_CHUNK):
+        placeholders = ",".join("?" for _ in group)
+        existing.update(
+            row[0]
+            for row in database.execute(
+                "SELECT id FROM clients WHERE id IN (%s)" % placeholders, group
+            )
         )
-    }
     missing = [cid for cid in ids if cid not in existing]
     if missing:
         raise BatchUpdateError("找不到对应客户，编号：%s" % "、".join(str(c) for c in missing))
 
     assignments = ", ".join("%s = ?" % field_name for field_name in actions)
-    params = list(actions.values()) + ids
+    values = list(actions.values())
     try:
-        database.execute(
-            "UPDATE clients SET %s WHERE id IN (%s)" % (assignments, placeholders), params
-        )
+        for group in chunks(ids, ID_QUERY_CHUNK):
+            placeholders = ",".join("?" for _ in group)
+            database.execute(
+                "UPDATE clients SET %s WHERE id IN (%s)" % (assignments, placeholders),
+                values + group,
+            )
         database.commit()
     except sqlite3.DatabaseError:
         database.rollback()
