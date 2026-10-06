@@ -640,6 +640,36 @@ FIELD_LABELS = {
 # 超过它的整数无法作为编号保存或查询，必须在进入数据库前明确拒绝。
 MAX_CLIENT_ID = 9223372036854775807
 
+# SQLite 单条语句允许的最大绑定参数数量（SQLITE_MAX_VARIABLE_NUMBER）。
+# 不同版本取值不同（历史上 999、32766，较新版本 250000），因此以运行时
+# 查询为准；批量修改一次选择的客户数可能超过它，不能把全部编号塞进单条
+# 语句的 IN(?,…)，必须分块执行。
+DEFAULT_SQL_VARIABLE_LIMIT = 999
+COMPILE_OPTION_PREFIX = "MAX_VARIABLE_NUMBER="
+
+
+def sql_variable_limit(database):
+    """返回运行时 SQLite 单条语句可绑定的最大参数数量。
+
+    取自编译选项 MAX_VARIABLE_NUMBER（各 SQLite 版本默认值不同：999、32766、
+    250000）；取不到时回退到保守的历史默认值 999。
+    """
+    try:
+        for (option,) in database.execute("PRAGMA compile_options"):
+            if option.startswith(COMPILE_OPTION_PREFIX):
+                limit = int(option[len(COMPILE_OPTION_PREFIX):])
+                if limit > 0:
+                    return limit
+    except (sqlite3.DatabaseError, ValueError):
+        pass
+    return DEFAULT_SQL_VARIABLE_LIMIT
+
+
+def _chunked(items, size):
+    """把 items 切成长度不超过 size 的若干块。"""
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
 
 def _normalize_set_value(field_name, value):
     """校验 set 操作的值并返回最终入库值；非法时抛 BatchUpdateError。
@@ -712,23 +742,35 @@ def batch_update_clients(database, payload):
     if not actions:
         raise BatchUpdateError("全部字段均保持原值：请至少选择一个字段进行设置或清空")
 
-    placeholders = ",".join("?" for _ in ids)
-    existing = {
-        row[0]
-        for row in database.execute(
-            "SELECT id FROM clients WHERE id IN (%s)" % placeholders, ids
+    # 一次选择的客户数可能超过 SQLite 单条语句的参数上限，存在性检查与 UPDATE
+    # 都按参数上限分块；UPDATE 的多个分块在同一事务内一次提交，整笔修改要么
+    # 全部生效要么全部不生效，不会因分块变成多次部分修改。
+    variable_limit = sql_variable_limit(database)
+
+    existing = set()
+    for id_chunk in _chunked(ids, variable_limit):
+        placeholders = ",".join("?" for _ in id_chunk)
+        existing.update(
+            row[0]
+            for row in database.execute(
+                "SELECT id FROM clients WHERE id IN (%s)" % placeholders, id_chunk
+            )
         )
-    }
     missing = [cid for cid in ids if cid not in existing]
     if missing:
         raise BatchUpdateError("找不到对应客户，编号：%s" % "、".join(str(c) for c in missing))
 
+    # 每条 UPDATE 还要为每个修改字段绑定一个赋值参数，编号分块需相应留出位置。
+    id_chunk_size = max(1, variable_limit - len(actions))
     assignments = ", ".join("%s = ?" % field_name for field_name in actions)
-    params = list(actions.values()) + ids
+    values = list(actions.values())
     try:
-        database.execute(
-            "UPDATE clients SET %s WHERE id IN (%s)" % (assignments, placeholders), params
-        )
+        for id_chunk in _chunked(ids, id_chunk_size):
+            placeholders = ",".join("?" for _ in id_chunk)
+            database.execute(
+                "UPDATE clients SET %s WHERE id IN (%s)" % (assignments, placeholders),
+                values + id_chunk,
+            )
         database.commit()
     except sqlite3.DatabaseError:
         database.rollback()
