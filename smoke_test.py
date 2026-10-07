@@ -852,6 +852,162 @@ def main():
         expect("未选中客户与客户总数仍不变",
                client_by_id(id_j) == before_j
                and len(req("GET", "/api/clients")[1]["clients"]) == id_total)
+
+        # ===== 编号上限回归：JSON 正整数超过 2^63-1 必须整次拒绝 =====
+        # 34. 准备四名客户：界测甲/界测乙四个可修改字段互不相同，界测丙的地区与
+        #     重要日期导入时即未填写（验证拒绝后空字段不会被补入他人内容），
+        #     界测丁不参与选择（未选中对照）。
+        max_client_id = 9223372036854775807
+        overflow_id = max_client_id + 1
+        huge_id = 10 ** 21
+        s, d = import_csv(
+            "name,source,region,industry,important_date\n"
+            "界测甲,上A,界东,界造,2030-01-01\n"
+            "界测乙,上B,界南,界售,2031-02-02\n"
+            "界测丙,上C,,界服,\n"
+            "界测丁,上D,界北,界餐,2032-03-03\n"
+        )
+        expect("编号上限客户导入 4 新增", s == 200 and d["imported_count"] == 4, d)
+        id_k, id_l, id_m, id_n = (x["id"] for x in d["imported"])
+        before_k = client_by_id(id_k)
+        before_l = client_by_id(id_l)
+        before_m = client_by_id(id_m)
+        before_n = client_by_id(id_n)
+        expect("界测甲乙资料互不相同",
+               before_k["source"] != before_l["source"]
+               and before_k["region"] != before_l["region"]
+               and before_k["industry"] != before_l["industry"]
+               and before_k["important_date"] != before_l["important_date"],
+               (before_k, before_l))
+        expect("界测丙地区与重要日期原本未填写",
+               before_m["region"] is None and before_m["important_date"] is None
+               and before_m["source"] == "上C" and before_m["industry"] == "界服", before_m)
+        overflow_snapshot = req("GET", "/api/clients")[1]
+        overflow_total = len(overflow_snapshot["clients"])
+
+        # 同次请求同时包含完全合法的设置与清空：编号越界时一项都不能先保存。
+        overflow_updates = {
+            "source": {"op": "set", "value": " 越界不应保存的来源 "},
+            "industry": {"op": "clear"},
+            "region": {"op": "keep"},
+            "important_date": {"op": "keep"},
+        }
+
+        # JSON 整数本身超过上限（与数字形式的文本、浮点数不是同一种输入，后者已在
+        # 第 31 步覆盖）：恰好上限加一、明显更大的正整数；越界值排在正常编号之前或
+        # 之后、正常编号重复出现，结论都必须相同。
+        overflow_cases = [
+            ("上限加一-越界在正常编号之前", overflow_id, [overflow_id, id_k, id_l, id_m]),
+            ("上限加一-越界在正常编号之后", overflow_id, [id_k, id_l, id_m, overflow_id]),
+            ("上限加一-正常编号重复且越界在前", overflow_id, [overflow_id, id_k, id_l, id_k, id_m]),
+            ("上限加一-正常编号重复且越界在后", overflow_id, [id_k, id_k, id_l, overflow_id, id_m]),
+            ("明显更大的正整数-越界在前", huge_id, [huge_id, id_k, id_l, id_m]),
+            ("明显更大的正整数-越界在后", huge_id, [id_k, id_l, id_m, huge_id]),
+        ]
+        for label, bad, ids in overflow_cases:
+            s, d = batch_update(ids, overflow_updates)
+            expect("越界编号 400：" + label,
+                   s == 400 and "updated_count" not in d, (s, d))
+            err = d.get("error")
+            expect("越界原因非空可读：" + label,
+                   isinstance(err, str) and bool(err.strip()), d)
+            expect("越界原因说明超出范围、给出越界值与允许上限：" + label,
+                   "超出可接受范围" in err and str(max_client_id) in err
+                   and str(bad) in err, err)
+            expect("越界不能说成客户不存在：" + label,
+                   "找不到" not in err and "不存在" not in err, err)
+            expect("越界整次不写入：" + label,
+                   req("GET", "/api/clients")[1] == overflow_snapshot)
+
+        # 回复必须完整送达：带 Content-Length、响应体按长度读全且可解析，不能断开
+        # 连接让用户拿不到明确结果（read 读到不完整响应会直接抛异常）。
+        import http.client
+        host_port = BASE.replace("http://", "", 1).split(":")
+        conn = http.client.HTTPConnection(host_port[0], int(host_port[1]), timeout=5)
+        raw_req = json.dumps(
+            {"ids": [overflow_id, id_k], "updates": overflow_updates}).encode("utf-8")
+        conn.request("POST", "/api/clients/batch-update", body=raw_req,
+                     headers={"Content-Type": "application/json"})
+        raw_resp = conn.getresponse()
+        raw_status = raw_resp.status
+        raw_headers = {k.lower(): v for k, v in raw_resp.getheaders()}
+        raw_body = raw_resp.read()
+        conn.close()
+        expect("越界回复完整可读未断开连接",
+               raw_status == 400 and raw_body.rstrip().endswith(b"}")
+               and int(raw_headers.get("content-length", -1)) == len(raw_body)
+               and "超出可接受范围" in json.loads(raw_body)["error"],
+               (raw_status, raw_headers, raw_body))
+
+        # 全部拒绝后逐客户核对：来源、地区、行业与重要日期分别保持自己的原值
+        # （界测丙原本为空的地区与日期仍为空，不能被补入他人内容），合法的设置与
+        # 清空没有留下部分修改；编号、名称、客户总数与未选中客户都不变。
+        expect("界测甲拒绝后全部字段保持原值", client_by_id(id_k) == before_k,
+               client_by_id(id_k))
+        expect("界测乙拒绝后全部字段保持原值", client_by_id(id_l) == before_l,
+               client_by_id(id_l))
+        expect("界测丙拒绝后全部字段保持原值（含原本未填写项）",
+               client_by_id(id_m) == before_m, client_by_id(id_m))
+        expect("未选中的界测丁不受影响", client_by_id(id_n) == before_n,
+               client_by_id(id_n))
+        expect("越界拒绝后编号名称与客户总数不变",
+               client_by_id(id_k)["id"] == id_k and client_by_id(id_l)["id"] == id_l
+               and client_by_id(id_m)["id"] == id_m
+               and len(req("GET", "/api/clients")[1]["clients"]) == overflow_total)
+
+        # 35. 上限值 2^63-1 本身是范围内整数：没有对应客户时按现有规则报
+        #     「找不到对应客户」并给出该编号，不能误报成超出范围；与合法编号混排、
+        #     顺序不同时结论相同，同样整次不写入。
+        for label, ids in (
+            ("仅上限编号", [max_client_id]),
+            ("上限编号在合法编号之后", [id_k, max_client_id]),
+            ("上限编号在合法编号之前", [max_client_id, id_k]),
+        ):
+            s, d = batch_update(ids, overflow_updates)
+            expect("上限值按找不到客户处理 400：" + label,
+                   s == 400 and "updated_count" not in d, (s, d))
+            err = d.get("error", "")
+            expect("上限值原因说明找不到该编号：" + label,
+                   isinstance(err, str) and "找不到对应客户" in err
+                   and str(max_client_id) in err, d)
+            expect("上限值不能误报为超出范围：" + label,
+                   "超出可接受范围" not in err and "范围" not in err, err)
+            expect("上限值查找整次不写入：" + label,
+                   req("GET", "/api/clients")[1] == overflow_snapshot)
+
+        # 36. 移除越界编号、只保留已登记客户后，同样的合法修改一次成功：重复编号只
+        #     计一名客户；设置与清空只作用于所选客户，未要求修改的字段各自保留原值
+        #     （界测丙原本为空的地区与日期仍为空，不被统一、不被补值）；未选中客户、
+        #     编号名称与客户总数保持原样。
+        s, d = batch_update([id_k, id_k, id_l, id_m, id_k], {
+            "source": {"op": "set", "value": "  边界回归新来源  "},
+            "industry": {"op": "clear"},
+        })
+        expect("移除越界编号后 200 且重复编号去重处理 3 名",
+               s == 200 and d == {"updated_count": 3}, (s, d))
+        k_now, l_now, m_now = client_by_id(id_k), client_by_id(id_l), client_by_id(id_m)
+        expect("明确设置的来源写入全部选中客户（去前后空白）",
+               k_now["source"] == "边界回归新来源"
+               and l_now["source"] == "边界回归新来源"
+               and m_now["source"] == "边界回归新来源", (k_now, l_now, m_now))
+        expect("明确清空的行业为 null（含原本有值者）",
+               k_now["industry"] is None and l_now["industry"] is None
+               and m_now["industry"] is None, (k_now, l_now, m_now))
+        expect("未要求修改的地区各自保留原值、不被统一或补值",
+               k_now["region"] == "界东" and l_now["region"] == "界南"
+               and m_now["region"] is None, (k_now, l_now, m_now))
+        expect("未要求修改的重要日期各自保留原值、不被统一或补值",
+               k_now["important_date"] == "2030-01-01"
+               and l_now["important_date"] == "2031-02-02"
+               and m_now["important_date"] is None, (k_now, l_now, m_now))
+        expect("编号与名称不变",
+               k_now["id"] == id_k and k_now["name"] == "界测甲"
+               and l_now["id"] == id_l and l_now["name"] == "界测乙"
+               and m_now["id"] == id_m and m_now["name"] == "界测丙",
+               (k_now, l_now, m_now))
+        expect("越界回归后未选中客户与客户总数仍不变",
+               client_by_id(id_n) == before_n
+               and len(req("GET", "/api/clients")[1]["clients"]) == overflow_total)
     finally:
         proc.terminate()
         proc.wait(timeout=5)
