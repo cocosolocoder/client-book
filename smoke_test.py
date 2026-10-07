@@ -852,6 +852,169 @@ def main():
         expect("未选中客户与客户总数仍不变",
                client_by_id(id_j) == before_j
                and len(req("GET", "/api/clients")[1]["clients"]) == id_total)
+
+        # ===== 客户编号上限（SQLite INTEGER 最大值 2^63-1）边界回归 =====
+        # 这里覆盖的是 JSON 整数本身超过上限：它与数字形式的文本、浮点数不属于
+        # 同一种输入情况（后两者仍按第 31 步的「编号必须为正整数」拒绝）。
+        # 34. 准备四名客户：界测甲/界测乙四个可修改字段互不相同，界测丙来源、行业、
+        #     重要日期导入时即未填写（验证拒绝后空字段不会被先写入或从他人补值），
+        #     界测丁不参与选择（未选中对照）。
+        MAX_ID = 9223372036854775807
+        OVER_ID = MAX_ID + 1
+        HUGE_ID = 99999999999999999999
+        s, d = import_csv(
+            "name,source,region,industry,important_date\n"
+            "界测甲,转介绍,华中,建筑业,2016-07-08\n"
+            "界测乙,网络投放,华西,物流业,2015-09-10\n"
+            "界测丙,,华南,,\n"
+            "界测丁,代理,海外,金融业,2014-04-04\n"
+        )
+        expect("编号上限客户导入 4 新增", s == 200 and d["imported_count"] == 4, d)
+        id_k1, id_k2, id_k3, id_k4 = (x["id"] for x in d["imported"])
+        before_k1 = client_by_id(id_k1)
+        before_k2 = client_by_id(id_k2)
+        before_k3 = client_by_id(id_k3)
+        before_k4 = client_by_id(id_k4)
+        expect("界测甲乙资料互不相同",
+               before_k1["source"] != before_k2["source"]
+               and before_k1["region"] != before_k2["region"]
+               and before_k1["industry"] != before_k2["industry"]
+               and before_k1["important_date"] != before_k2["important_date"],
+               (before_k1, before_k2))
+        expect("界测丙来源/行业/日期原本为空",
+               before_k3["source"] is None and before_k3["industry"] is None
+               and before_k3["important_date"] is None, before_k3)
+        limit_snapshot = req("GET", "/api/clients")[1]
+        limit_total = len(limit_snapshot["clients"])
+
+        # 同次请求同时包含完全合法的设置与清空：编号越界时整次拒绝，二者都不得落库。
+        limit_legal_updates = {
+            "source": {"op": "set", "value": " 越界编号不应保存的来源 "},
+            "industry": {"op": "clear"},
+        }
+
+        # 越界值必须是 JSON 整数字面量（无小数点、无指数、不是文本），否则就退化成
+        # 第 31 步覆盖的另一类输入；直接核对序列化后的请求体锁定这一点。
+        wire = json.dumps({"ids": [OVER_ID, id_k1], "updates": limit_legal_updates})
+        expect("越界值以 JSON 整数字面量发送",
+               '"ids": [9223372036854775808,' in wire
+               and "9223372036854775808.0" not in wire
+               and "9.223" not in wire, wire)
+
+        # 越界编号无论排在正常编号之前还是之后、正常编号是否重复出现、同次是否还选了
+        # 含空字段的客户，都必须整次 400 拒绝，且任何客户都不改变。
+        over_cases = [
+            ("上限+1 排在正常编号之前", OVER_ID, [OVER_ID, id_k1, id_k2]),
+            ("上限+1 排在正常编号之后", OVER_ID, [id_k1, id_k2, OVER_ID]),
+            ("明显更大的整数排在正常编号之前", HUGE_ID, [HUGE_ID, id_k2, id_k1]),
+            ("明显更大的整数排在正常编号之后", HUGE_ID, [id_k1, id_k2, HUGE_ID]),
+            ("正常编号重复且上限+1 排在末尾", OVER_ID, [id_k1, id_k1, id_k2, OVER_ID]),
+            ("正常编号重复且更大整数排在开头", HUGE_ID, [HUGE_ID, id_k1, id_k2, id_k1]),
+            ("上限+1 与含空字段客户同时提交", OVER_ID, [id_k1, id_k3, OVER_ID]),
+        ]
+        for label, offending, ids in over_cases:
+            s, d = batch_update(ids, limit_legal_updates)
+            expect("越界编号 400：" + label,
+                   s == 400 and isinstance(d, dict) and "updated_count" not in d,
+                   (s, d, ids))
+            err = d.get("error")
+            expect("越界原因非空可读、指出超出范围并写明上限：" + label,
+                   isinstance(err, str) and bool(err.strip())
+                   and "超出可接受范围" in err and str(MAX_ID) in err, err)
+            # 原因中逐位给出越界整数值，证明服务按整数精确接收，没有被浮点取整。
+            expect("越界原因含逐位准确的越界编号：" + label,
+                   isinstance(err, str) and str(offending) in err, err)
+            expect("越界原因不把错误说成客户不存在：" + label,
+                   isinstance(err, str) and "找不到" not in err and "不存在" not in err,
+                   err)
+            # 每次拒绝后整份列表必须与提交前完全一致，无部分修改。
+            expect("越界整次不写入：" + label,
+                   req("GET", "/api/clients")[1] == limit_snapshot)
+
+        # 全部拒绝后逐客户核对：四名可修改字段分别保持自己的原值，资料互不相同的
+        # 客户没有被统一成某人的原值，原本未填写的字段仍是未填写（不从其他客户补值）；
+        # 客户编号、名称、总数与未选中客户都不变。
+        expect("界测甲保持提交前全部资料",
+               client_by_id(id_k1) == before_k1, client_by_id(id_k1))
+        expect("界测乙保持提交前全部资料、未被统一成甲的原值",
+               client_by_id(id_k2) == before_k2, client_by_id(id_k2))
+        expect("界测丙空字段仍为空、非空字段保留",
+               client_by_id(id_k3) == before_k3, client_by_id(id_k3))
+        expect("未选中的界测丁不受影响", client_by_id(id_k4) == before_k4,
+               client_by_id(id_k4))
+        expect("越界拒绝后编号名称与客户总数不变",
+               client_by_id(id_k1)["id"] == id_k1 and client_by_id(id_k2)["id"] == id_k2
+               and client_by_id(id_k3)["name"] == "界测丙"
+               and len(req("GET", "/api/clients")[1]["clients"]) == limit_total)
+        # 拒绝回复必须完整可读、不能靠断开连接结束：拒绝之后服务与连接仍可正常使用。
+        s, h = req("GET", "/health")
+        expect("拒绝后服务仍正常响应", s == 200 and h == {"status": "ok", "product": "ClientBook"}, h)
+
+        # 35. 边界两侧必须区分：上限值 9223372036854775807 本身是范围内的整数，
+        #     在没有对应客户时按既有规则报「找不到对应客户」，而不是报超范围。
+        s, d = batch_update([MAX_ID], limit_legal_updates)
+        err = d.get("error", "")
+        expect("上限值本身在范围内：无客户时按找不到编号 400",
+               s == 400 and "updated_count" not in d
+               and "找不到" in err and str(MAX_ID) in err and "超出" not in err,
+               (s, d))
+        expect("上限值探测整次不写入", req("GET", "/api/clients")[1] == limit_snapshot)
+        s, d = batch_update([id_k1, id_k2, MAX_ID], limit_legal_updates)
+        err = d.get("error", "")
+        expect("上限值与正常编号混合时仍按找不到编号 400",
+               s == 400 and "updated_count" not in d
+               and "找不到" in err and str(MAX_ID) in err and "超出" not in err,
+               (s, d))
+        expect("上限值混合探测整次不写入", req("GET", "/api/clients")[1] == limit_snapshot)
+
+        # 数值同样越过上限的数字文本与浮点，属于第 31 步的「必须为正整数」类别，
+        # 不走超范围分支——锁定两类输入情况的区别。
+        s, d = batch_update_raw({"ids": [str(OVER_ID), id_k1],
+                                 "updates": limit_legal_updates})
+        err = d.get("error", "")
+        expect("数字形式的文本按非正整数拒绝、不报超范围",
+               s == 400 and "updated_count" not in d
+               and "正整数" in err and "超出" not in err, (s, d))
+        s, d = batch_update_raw({"ids": [id_k2, float(OVER_ID)],
+                                 "updates": limit_legal_updates})
+        err = d.get("error", "")
+        expect("超过上限的浮点仍按非正整数拒绝、不报超范围",
+               s == 400 and "updated_count" not in d
+               and "正整数" in err and "超出" not in err, (s, d))
+        expect("文本/浮点对照后仍整次不写入",
+               req("GET", "/api/clients")[1] == limit_snapshot)
+
+        # 36. 移除越界编号、只保留已登记客户后，同样的合法修改一次成功：重复编号只
+        #     计一名客户；设置与清空只作用于所选客户，未要求修改的字段各自保留原值，
+        #     原本为空的字段不被补入他人内容。
+        s, d = batch_update([id_k1, id_k1, id_k2, id_k3, id_k1], {
+            "source": {"op": "set", "value": "  上限边界回归来源  "},
+            "industry": {"op": "clear"},
+        })
+        expect("移除越界编号后 200 且重复编号去重处理 3 名",
+               s == 200 and d == {"updated_count": 3}, (s, d))
+        k1_now, k2_now, k3_now = (client_by_id(i) for i in (id_k1, id_k2, id_k3))
+        expect("合法设置与清空只作用所选客户（来源设置、行业清空）",
+               k1_now["source"] == "上限边界回归来源"
+               and k2_now["source"] == "上限边界回归来源"
+               and k3_now["source"] == "上限边界回归来源"
+               and k1_now["industry"] is None and k2_now["industry"] is None
+               and k3_now["industry"] is None, (k1_now, k2_now, k3_now))
+        expect("未要求修改的地区各自保留原值",
+               k1_now["region"] == "华中" and k2_now["region"] == "华西"
+               and k3_now["region"] == "华南", (k1_now, k2_now, k3_now))
+        expect("未要求修改的重要日期各自保留原值（含原本为空者）",
+               k1_now["important_date"] == "2016-07-08"
+               and k2_now["important_date"] == "2015-09-10"
+               and k3_now["important_date"] is None, (k1_now, k2_now, k3_now))
+        expect("编号与名称不变",
+               k1_now["id"] == id_k1 and k1_now["name"] == "界测甲"
+               and k2_now["id"] == id_k2 and k2_now["name"] == "界测乙"
+               and k3_now["id"] == id_k3 and k3_now["name"] == "界测丙",
+               (k1_now, k2_now, k3_now))
+        expect("未选中客户与客户总数仍不变",
+               client_by_id(id_k4) == before_k4
+               and len(req("GET", "/api/clients")[1]["clients"]) == limit_total)
     finally:
         proc.terminate()
         proc.wait(timeout=5)
