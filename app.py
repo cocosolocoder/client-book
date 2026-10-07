@@ -334,13 +334,14 @@ async function readServiceReply(res) {
   return {raw, data, parsed};
 }
 
-// CSV 导入与批量修改共用的可读原因识别：回复成功解析为 JSON 时，只取对象中的
-// 非空文本 error；只有回复不是 JSON 结构化数据时，才把纯文本原文（去首尾空白，
-// 最多前 200 个字符）当作原因。能解析成 JSON 却没有合格 error 的回复
-// （如 {"message":"..."}、null、[]、字符串形式的 JSON），或 error 只有空白、
-// 不是文本，都不算可读原因，不向用户倾倒结构；空回复同样返回空串。
-// trimJsonReason 只控制 JSON error 的呈现方式：导入去掉首尾空白，批量修改保留原文。
-function serviceReadableError(parsed, data, raw, trimJsonReason) {
+// CSV 导入与批量修改共用的可读原因识别：回复成功解析为 JSON 时，只接受对象中
+// 的非空文本 error；其他字段、数组、字符串/数字形式的 JSON、空白或非文本 error
+// 都不能作为拒绝依据。只有回复不是 JSON 结构化数据时，才把非空纯文本原文
+// （去首尾空白，最多前 200 个字符）当作原因。trimJsonReason 只控制 JSON error
+// 的呈现：导入去掉首尾空白，批量修改保留原文；纯文本原因两处都去首尾空白。
+// 空回复同样返回空串。
+function serviceReadableError(reply, trimJsonReason) {
+  const {raw, data, parsed} = reply;
   if (parsed) {
     if (data && typeof data === "object" && !Array.isArray(data) &&
         typeof data.error === "string") {
@@ -350,6 +351,27 @@ function serviceReadableError(parsed, data, raw, trimJsonReason) {
     return "";
   }
   return (raw || "").trim().slice(0, 200);
+}
+
+// CSV 导入与批量修改共用的「整次操作是否被明确拒绝」判断，两处只需维护这一处：
+// 唯一能确认拒绝的情形是 HTTP 400 且从回复中识别出可读原因
+// （规则见 serviceReadableError），确认时返回该原因。HTTP 400 没有可靠原因、
+// 回复读取失败、连接中断，以及 HTTP 500/502 等其他非成功状态都返回 null——
+// 即使其他错误状态带有原因，也不能声称客户资料未变或已经回滚，调用方一律按
+// 各自的「结果无法确认」口径提示。JSON 原因是否去首尾空白由 trimJsonReason
+// 决定（导入去掉、批量修改保留）。
+function rejectionReason(reply, status, trimJsonReason) {
+  if (status !== 400) return null;
+  const reason = serviceReadableError(reply, trimJsonReason);
+  return reason || null;
+}
+
+// 明确拒绝时两处共用的横幅：intro 是各自功能的结论（导入说明整份文件已拒绝、
+// 本次没有新增客户、原有资料保持原样；批量修改说明本次修改已全部拒绝、客户
+// 资料保持原样），随后换行统一展示原因供用户修正。原因经 esc 转义，特殊字符
+// 一律按文字显示，不展示原始 JSON。
+function rejectedOperationHtml(intro, reason) {
+  return '<div class="banner bad">' + intro + "<br>原因：" + esc(reason) + "</div>";
 }
 
 // 没有取得可靠保存结论时的统一口径（非 400 错误、400 无可读原因、连接中断、
@@ -416,16 +438,18 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
       showBatchReport(unconfirmedBatchHtml("保存回复无法读取（HTTP " + res.status + "）："));
       return;
     }
-    const {raw, data, parsed} = reply;
+    const {data, parsed} = reply;
 
     if (res.status === 400) {
-      // 约定：只有 HTTP 400 且带有明确可读的拒绝原因时，才表示整次修改被拒绝、
-      // 所有客户资料保持原样，并展示原因供用户修正。空回复或无法解析的 400
-      // （可能来自代理/网关）不能当成明确拒绝。
-      const reason = serviceReadableError(parsed, data, raw, false);
+      // 「整次修改被拒绝」与「结果无法确认」的分界与 CSV 导入共用同一判断
+      // （rejectionReason）：只有 HTTP 400 且带有明确可读的拒绝原因时，才表示
+      // 整次修改被拒绝、所有客户资料保持原样，并展示原因供用户修正；批量修改
+      // 保留 JSON 原因原文。空回复或无法解析的 400（可能来自代理/网关）不能
+      // 当成明确拒绝，按无法确认处理。
+      const reason = rejectionReason(reply, res.status, false);
       if (reason) {
-        showBatchReport('<div class="banner bad">本次修改已全部拒绝，客户资料保持原样。<br>原因：' +
-          esc(reason) + "</div>");
+        showBatchReport(rejectedOperationHtml(
+          "本次修改已全部拒绝，客户资料保持原样。", reason));
         return;
       }
       showBatchReport(unconfirmedBatchHtml(
@@ -436,7 +460,7 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
     if (!res.ok) {
       // 其他非成功状态（如 HTTP 500/502）：即使带有可解析的错误说明，也不能断言
       // 资料保持原样或已经回滚——客户资料可能已经被修改。保留已知状态码与可读说明。
-      const detail = serviceReadableError(parsed, data, raw, false);
+      const detail = serviceReadableError(reply, false);
       const prefix = detail
         ? "保存未成功（HTTP " + res.status + "）：" + esc(detail) + "。<br>"
         : "保存未成功（HTTP " + res.status + "），服务没有给出可展示的错误说明：";
@@ -598,18 +622,20 @@ document.getElementById("import-form").addEventListener("submit", async e => {
       showReport(unreliableReportHtml("导入回复无法读取（HTTP " + res.status + "）："));
       return;
     }
-    const {raw, data, parsed} = reply;
+    const {data, parsed} = reply;
 
     if (res.status === 400) {
-      // 只有 HTTP 400 且拿到明确、可读的拒绝原因（对象的非空文本 error，
-      // 或非空的纯文本错误说明，展示去首尾空白）时，才能确认整份文件被拒绝、
-      // 本次没有新增客户、原有资料保持原样。空回复、仅含空白、回复无法读取、
-      // 能解析成 JSON 却没有合格 error、error 只有空白或不是文本的，一律不能
-      // 当成明确拒绝：按无法确认处理，不展示原始 JSON，也不声称资料未变或已回滚。
-      const reason = serviceReadableError(parsed, data, raw, true);
+      // 「整份文件被拒绝」与「结果无法确认」的分界与批量修改共用同一判断
+      // （rejectionReason）：只有 HTTP 400 且拿到明确、可读的拒绝原因时，才能
+      // 确认整份文件被拒绝、本次没有新增客户、原有资料保持原样；导入的 JSON
+      // 原因去首尾空白。空回复、仅含空白、回复无法读取、能解析成 JSON 却没有
+      // 合格 error、error 只有空白或不是文本的，一律不能当成明确拒绝，按无法
+      // 确认处理：不展示原始 JSON，也不声称资料未变或已回滚。
+      const reason = rejectionReason(reply, res.status, true);
       if (reason) {
-        showReport('<div class="banner bad">整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。<br>原因：' +
-          esc(reason) + "</div>");
+        showReport(rejectedOperationHtml(
+          "整份文件已拒绝导入，本次没有新增客户，原有客户资料保持原样。",
+          reason));
         return;
       }
       showReport(unreliableReportHtml(
@@ -621,7 +647,7 @@ document.getElementById("import-form").addEventListener("submit", async e => {
       // 其他非成功状态（如 HTTP 500/502）：即使回复可解析，也不显示成功数量、
       // 不断言资料一定未变或已经回滚——客户资料可能已被修改。保留已知状态码
       // 与可读说明；没有可用说明时给出清楚的通用提示。
-      const detail = serviceReadableError(parsed, data, raw, true);
+      const detail = serviceReadableError(reply, true);
       showReport(unreliableReportHtml(detail
         ? "导入未成功（HTTP " + res.status + "）：" + esc(detail) + "。"
         : "导入未成功（HTTP " + res.status + "），服务没有给出可展示的错误说明："));
