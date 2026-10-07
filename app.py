@@ -120,6 +120,113 @@ const ESC = {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"};
 const esc = s => String(s === null || s === undefined ? "" : s).replace(/[&<>"']/g, c => ESC[c]);
 const blank = v => (v === null || v === undefined || v === "") ? '<span class="muted">—</span>' : esc(v);
 
+// 客户编号最大可达 2^63-1，超过 JS 安全整数上限 2^53-1：用 Number 解析 JSON 编号
+// 会丢失低位数字（9007199254740992 与 9007199254740993 会变成同一个数），导致两行
+// 显示同一编号、勾选一个影响另一个、提交出不存在或越界的编号。因此编号在页面内
+// 全程以「十进制原文」字符串保存、比较、勾选、排序与提交，绝不经过 Number。
+
+// 按编号的数值大小比较两个十进制正整数字符串（不转 Number，避免精度丢失）。
+function compareIdStrings(a, b) {
+  if (a.length !== b.length) return a.length - b.length;
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+// 从 /api/clients 的原始 JSON 文本中逐个取出每个客户 id 的十进制原文。
+// 纯字符码扫描：字符串字面量整体跳过（转义用字符码识别），只有当一个内容为
+// id 的字符串是「键」（闭合引号后跳过空白紧跟冒号）时，才读取冒号后的十进制
+// 整数文本；字符串值里出现的 "id" 或数字都不会被当成编号。这样不经过 Number、
+// 也不依赖正则（本页内嵌在 Python 普通字符串中，反斜杠会被 Python 转义），
+// 大编号一位不丢。返回编号原文数组，顺序与 JSON 中出现顺序一致。
+function extractRawIds(raw) {
+  const Q = 34, BS = 92, COLON = 58, D0 = 48, D9 = 57;
+  const isWs = c => c === 32 || c === 9 || c === 10 || c === 13;
+  const tokens = [];
+  const n = raw.length;
+  let i = 0;
+  while (i < n) {
+    if (raw.charCodeAt(i) !== Q) { i++; continue; }
+    // 跳过一个完整字符串字面量，记录其内容范围与闭合引号位置。
+    const contentStart = i + 1;
+    let j = i + 1;
+    while (j < n) {
+      const cc = raw.charCodeAt(j);
+      if (cc === BS) { j += 2; continue; }
+      if (cc === Q) break;
+      j++;
+    }
+    const contentEnd = j;
+    let k = j + 1;
+    while (k < n && isWs(raw.charCodeAt(k))) k++;
+    const isKey = raw.charCodeAt(k) === COLON;
+    i = j + 1;
+    if (!isKey || raw.slice(contentStart, contentEnd) !== "id") continue;
+    // 冒号后跳过空白，读取十进制整数原文。
+    let p = k + 1;
+    while (p < n && isWs(raw.charCodeAt(p))) p++;
+    const numStart = p;
+    while (p < n) {
+      const cc = raw.charCodeAt(p);
+      if (cc < D0 || cc > D9) break;
+      p++;
+    }
+    if (numStart === p) continue; // 非整数（字符串、负数、null 等）：交由数量校验拒绝
+    const after = raw.charCodeAt(p);
+    // 数字后不能紧跟小数点或指数标记，否则不是整数字面量。
+    if (after === 46 || after === 101 || after === 69) continue;
+    tokens.push(raw.slice(numStart, p));
+  }
+  return tokens;
+}
+
+// 从 /api/clients 的原始 JSON 文本中解析客户列表：结构仍按 JSON 校验（clients
+// 必须是数组），但每个客户的 id 直接取 JSON 原文中的十进制整数文本，保证大编号
+// 一位不丢；其余字段按普通 JSON 值使用。编号缺失或不是十进制整数字面量的回复
+// 一律视为无效列表。
+function parseClientsResponse(raw) {
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (err) {
+    throw err;
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data) ||
+      !Array.isArray(data.clients)) {
+    throw new Error("响应未包含有效的客户列表");
+  }
+  const idTokens = extractRawIds(raw);
+  if (idTokens.length !== data.clients.length) {
+    throw new Error("响应未包含有效的客户列表");
+  }
+  return data.clients.map((record, i) => ({
+    id: idTokens[i],
+    name: record.name,
+    source: record.source,
+    region: record.region,
+    industry: record.industry,
+    important_date: record.important_date,
+  }));
+}
+
+// 编号在页面内部一律用十进制字符串，以免大编号丢精度；但提交给接口的 ids 仍是
+// JSON 整数。安全整数范围内的编号转回数字（与既有页面行为一致，排序等数值逻辑
+// 不变），超出安全整数范围（可能超过 2^53-1）的编号保留十进制原文——两者在
+// encodeBatchBody 里都写成不带引号的 JSON 整数字面量，一位不丢、也不改变接口。
+function idToPayloadValue(idText) {
+  const num = Number(idText);
+  return Number.isSafeInteger(num) && String(num) === idText ? num : idText;
+}
+
+// 把批量修改请求序列化为 JSON：ids 仍是 JSON 整数数组（大编号以十进制原文直接
+// 写入，不包成字符串、不经过 Number/JSON.stringify 的数字转换），updates 结构
+// 与现有接口完全一致。
+function encodeBatchBody(payload) {
+  const idsLiteral = payload.ids
+    .map(v => typeof v === "number" ? String(v) : v)
+    .join(",");
+  return '{"ids":[' + idsLiteral +
+    '],"updates":' + JSON.stringify(payload.updates) + "}";
+}
+
 const BATCH_FIELDS = [
   {key: "source", label: "来源"},
   {key: "region", label: "地区"},
@@ -128,6 +235,8 @@ const BATCH_FIELDS = [
 ];
 
 let clients = [];
+// 已选编号统一保存十进制原文（字符串），不经过 Number：大于 2^53 的不同编号
+// 转成 Number 后会相等，用字符串才能把相邻大编号区分成不同客户。
 const selected = new Set();
 // 一次批量保存从发出到本次结果处理结束期间为 true：期间只能有这一次请求，
 // 勾选变化与表单重复提交都不能解除或新增请求。
@@ -171,11 +280,8 @@ async function loadClients() {
   try {
     const res = await fetch("/api/clients");
     if (!res.ok) throw new Error("服务返回非成功状态（HTTP " + res.status + "）");
-    const data = await res.json();
-    if (!data || !Array.isArray(data.clients)) {
-      throw new Error("响应未包含有效的客户列表");
-    }
-    list = data.clients;
+    const raw = await res.text();
+    list = parseClientsResponse(raw);
   } catch (err) {
     // 已有更新的读取发起：本次旧回复（包括连接错误、非成功状态、无法解析）
     // 不再影响页面，不新增读取失败提示，也不动表格与勾选。
@@ -241,7 +347,7 @@ function renderSelection() {
     list.innerHTML = '<span class="muted">尚未勾选任何客户，勾选列表中的客户后可批量修改。</span>';
   } else {
     const byId = new Map(clients.map(r => [r.id, r]));
-    list.innerHTML = [...selected].sort((a, b) => a - b).map(id => {
+    list.innerHTML = [...selected].sort(compareIdStrings).map(id => {
       const r = byId.get(id);
       return '<span class="sel-chip">#' + esc(id) + " " + esc(r ? r.name : "") +
         ' <button type="button" data-remove="' + esc(id) + '" title="取消勾选该客户">×</button></span>';
@@ -249,7 +355,7 @@ function renderSelection() {
   }
   syncSubmitState();
   document.querySelectorAll("#clients-body tr").forEach(tr => {
-    tr.classList.toggle("selected", selected.has(Number(tr.dataset.id)));
+    tr.classList.toggle("selected", selected.has(tr.dataset.id));
   });
   syncCheckAll();
 }
@@ -293,7 +399,10 @@ function collectBatchPayload() {
       updates[key] = {op: "set", value: card.querySelector(".bf-value").value};
     }
   }
-  return {ids: [...selected].sort((a, b) => a - b), updates};
+  return {
+    ids: [...selected].sort(compareIdStrings).map(idToPayloadValue),
+    updates,
+  };
 }
 
 function resetBatchForm() {
@@ -388,7 +497,7 @@ document.getElementById("check-all").addEventListener("change", e => {
 
 document.getElementById("clients-body").addEventListener("change", e => {
   if (!e.target.classList.contains("row-check")) return;
-  const id = Number(e.target.value);
+  const id = e.target.value;
   if (e.target.checked) selected.add(id);
   else selected.delete(id);
   renderSelection();
@@ -397,7 +506,7 @@ document.getElementById("clients-body").addEventListener("change", e => {
 document.getElementById("sel-list").addEventListener("click", e => {
   const btn = e.target.closest("[data-remove]");
   if (!btn) return;
-  selected.delete(Number(btn.dataset.remove));
+  selected.delete(btn.dataset.remove);
   renderClients();
   renderSelection();
 });
@@ -421,7 +530,7 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
     const res = await fetch("/api/clients/batch-update", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
+      body: encodeBatchBody(payload),
     });
     // 错误回复可能是 {error:"..."}、一段纯文本说明，也可能是空回复；
     // 没有可靠结论时一律不能当作明确拒绝或保存成功。
