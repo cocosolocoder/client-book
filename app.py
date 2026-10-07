@@ -145,6 +145,68 @@ let importing = false;
 // 也不能撤掉更新读取已经给出的提示或换掉它保留的表格。
 let loadSeq = 0;
 
+// 客户编号最大可到 9223372036854775807（2^63-1），超出 JS 安全整数范围：
+// 直接 JSON.parse 会把 9007199254740993 这样的大编号舍入成相近数值，两个
+// 不同客户可能显示成同一编号。这里在解析前把超出安全范围的整数字面量原样
+// 包成字符串（逐字符扫描，跳过字符串内容，只处理结构中的数字），解析后
+// 编号一律以精确十进制文本保存、显示与比较；提交批量修改时再原样拼回
+// JSON 整数——接口上的编号仍是 JSON 整数，不改成文本编号。
+function quoteUnsafeIntTokens(jsonText) {
+  let out = "";
+  let i = 0;
+  const n = jsonText.length;
+  let inString = false;
+  while (i < n) {
+    const c = jsonText[i];
+    if (inString) {
+      out += c;
+      if (c === "\\\\" && i + 1 < n) {
+        out += jsonText[i + 1];
+        i += 2;
+        continue;
+      }
+      if (c === '"') inString = false;
+      i += 1;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      out += c;
+      i += 1;
+      continue;
+    }
+    if (c === "-" || (c >= "0" && c <= "9")) {
+      let j = i + 1;
+      while (j < n && /[0-9.eE+-]/.test(jsonText[j])) j += 1;
+      const token = jsonText.slice(i, j);
+      // 只处理纯整数字面量；超出安全整数范围（含恰好 2^53）的包成字符串，
+      // 保留原始数字文本，安全范围内的保持原样由 JSON.parse 解析成数字。
+      if (/^-?\d+$/.test(token) && !Number.isSafeInteger(Number(token))) {
+        out += '"' + token + '"';
+      } else {
+        out += token;
+      }
+      i = j;
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+// 编号在页面内统一为精确十进制文本（安全范围内的数字由 String 转换结果精确，
+// 更大的一开始就是原文字符串），比较、查找、显示都用它。
+function clientIdText(id) {
+  return typeof id === "string" ? id : String(id);
+}
+
+// 正整数十进制文本（无前导零）的数值序：先比位数，位数相同按字典序。
+function compareClientIds(a, b) {
+  if (a.length !== b.length) return a.length - b.length;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function syncSubmitState() {
   const btn = document.getElementById("batch-submit");
   btn.disabled = batchSaving || selected.size === 0;
@@ -171,11 +233,14 @@ async function loadClients() {
   try {
     const res = await fetch("/api/clients");
     if (!res.ok) throw new Error("服务返回非成功状态（HTTP " + res.status + "）");
-    const data = await res.json();
+    // 先取原文再解析：大编号超出 JS 安全整数范围，须把这类整数字面量包成
+    // 字符串后再 JSON.parse，否则两个不同客户可能被舍入成同一编号。
+    const raw = await res.text();
+    const data = JSON.parse(quoteUnsafeIntTokens(raw));
     if (!data || !Array.isArray(data.clients)) {
       throw new Error("响应未包含有效的客户列表");
     }
-    list = data.clients;
+    list = data.clients.map(r => ({...r, id: clientIdText(r.id)}));
   } catch (err) {
     // 已有更新的读取发起：本次旧回复（包括连接错误、非成功状态、无法解析）
     // 不再影响页面，不新增读取失败提示，也不动表格与勾选。
@@ -241,7 +306,7 @@ function renderSelection() {
     list.innerHTML = '<span class="muted">尚未勾选任何客户，勾选列表中的客户后可批量修改。</span>';
   } else {
     const byId = new Map(clients.map(r => [r.id, r]));
-    list.innerHTML = [...selected].sort((a, b) => a - b).map(id => {
+    list.innerHTML = [...selected].sort(compareClientIds).map(id => {
       const r = byId.get(id);
       return '<span class="sel-chip">#' + esc(id) + " " + esc(r ? r.name : "") +
         ' <button type="button" data-remove="' + esc(id) + '" title="取消勾选该客户">×</button></span>';
@@ -249,7 +314,7 @@ function renderSelection() {
   }
   syncSubmitState();
   document.querySelectorAll("#clients-body tr").forEach(tr => {
-    tr.classList.toggle("selected", selected.has(Number(tr.dataset.id)));
+    tr.classList.toggle("selected", selected.has(tr.dataset.id));
   });
   syncCheckAll();
 }
@@ -293,7 +358,21 @@ function collectBatchPayload() {
       updates[key] = {op: "set", value: card.querySelector(".bf-value").value};
     }
   }
-  return {ids: [...selected].sort((a, b) => a - b), updates};
+  // 安全范围内的编号恢复为 JSON 数字，超出安全范围的保留精确十进制文本，
+  // 由 batchPayloadJson 原样拼成 JSON 整数（不经过 Number，不会丢精度）。
+  const ids = [...selected].sort(compareClientIds).map(id => {
+    const n = Number(id);
+    return Number.isSafeInteger(n) ? n : id;
+  });
+  return {ids, updates};
+}
+
+// ids 是精确十进制文本（可能超出 JS 安全整数范围），不能经 Number 再
+// JSON.stringify（会丢精度或直接被拒）；编号只含数字，原样拼接即得到
+// 接口要求的 JSON 整数数组，updates 仍按普通 JSON 序列化。
+function batchPayloadJson(payload) {
+  return '{"ids":[' + payload.ids.join(",") + '],"updates":' +
+    JSON.stringify(payload.updates) + "}";
 }
 
 function resetBatchForm() {
@@ -388,7 +467,8 @@ document.getElementById("check-all").addEventListener("change", e => {
 
 document.getElementById("clients-body").addEventListener("change", e => {
   if (!e.target.classList.contains("row-check")) return;
-  const id = Number(e.target.value);
+  // 编号按精确十进制文本处理，不能经 Number 转换（大编号会丢精度）。
+  const id = e.target.value;
   if (e.target.checked) selected.add(id);
   else selected.delete(id);
   renderSelection();
@@ -397,7 +477,7 @@ document.getElementById("clients-body").addEventListener("change", e => {
 document.getElementById("sel-list").addEventListener("click", e => {
   const btn = e.target.closest("[data-remove]");
   if (!btn) return;
-  selected.delete(Number(btn.dataset.remove));
+  selected.delete(btn.dataset.remove);
   renderClients();
   renderSelection();
 });
@@ -421,7 +501,7 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
     const res = await fetch("/api/clients/batch-update", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
+      body: batchPayloadJson(payload),
     });
     // 错误回复可能是 {error:"..."}、一段纯文本说明，也可能是空回复；
     // 没有可靠结论时一律不能当作明确拒绝或保存成功。
