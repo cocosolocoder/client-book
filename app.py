@@ -136,6 +136,14 @@ let batchSaving = false;
 // 刷新全部结束期间为 true：期间只能有最初发出的那一次导入请求；重复点击、
 // 回车等再次触发表单提交都直接忽略，不解除等待、不新增请求、不更换提示。
 let importing = false;
+// 客户列表读取的发起序号，只增不减：同一页面可能同时有多次读取在途
+// （首次打开、导入成功后、批量保存成功后都会各自发起一次）。先后以读取
+// 发起的时间为准，而不是回复到达的时间：只有序号仍等于当前最新值的读取
+// （即最近发起的那次）才能决定表格内容与读取提示；较早发起的读取无论
+// 成功、失败还是空列表、无论回复何时到达，都不再影响页面——不能覆盖
+// 更新读取已经显示的客户资料，不能新增读取失败或列表暂未更新的提示，
+// 也不能撤掉更新读取已经给出的提示或换掉它保留的表格。
+let loadSeq = 0;
 
 function syncSubmitState() {
   const btn = document.getElementById("batch-submit");
@@ -153,6 +161,11 @@ async function loadClients() {
   // 只在明确读到有效客户列表（真正的空列表也算）时才更新页面；
   // 连接错误、非成功状态、响应无法解析或未包含 clients 数组都视为读取失败：
   // 保留此前已显示的客户编号、名称与各字段内容，不清空表格、不显示空列表提示。
+  // 返回 "updated"（本次是最近发起的读取且已更新页面）或 "stale"（已有更新的
+  // 读取发起，本次结果不再影响页面）；最近发起的读取失败时抛错，由调用方
+  // 补充各自场景的提示。
+  const seq = ++loadSeq;
+  const stale = () => seq !== loadSeq;
   const note = document.getElementById("clients-load-error");
   let list;
   try {
@@ -164,6 +177,9 @@ async function loadClients() {
     }
     list = data.clients;
   } catch (err) {
+    // 已有更新的读取发起：本次旧回复（包括连接错误、非成功状态、无法解析）
+    // 不再影响页面，不新增读取失败提示，也不动表格与勾选。
+    if (stale()) return "stale";
     let message = err.message;
     if (err instanceof SyntaxError) message = "响应无法解析为有效数据";
     if (err instanceof TypeError) message = "无法连接到服务（网络错误）";
@@ -175,6 +191,9 @@ async function loadClients() {
     document.getElementById("clients-empty").classList.remove("on");
     throw new Error(message);
   }
+  // 等待回复期间已有更新的读取发起：本次旧列表（即使真实、即使是空列表）
+  // 不能抢先决定页面内容，客户行、读取提示、现有勾选与已选客户说明都保持不动。
+  if (stale()) return "stale";
   note.classList.remove("on");
   note.textContent = "";
   clients = list;
@@ -184,6 +203,7 @@ async function loadClients() {
   }
   renderClients();
   renderSelection();
+  return "updated";
 }
 
 function renderClients() {
@@ -442,11 +462,11 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
     selected.clear();
     renderClients();
     renderSelection();
-    let refreshed = true;
+    let refreshState = "updated";
     try {
-      await loadClients();
+      refreshState = await loadClients();
     } catch (loadErr) {
-      refreshed = false;
+      refreshState = "failed";
       // 刷新失败不自动重交刚才的修改，也不要求用户再次保存；旧表格（含勾选状态）
       // 已按保存成功的结果保留/清除，不被读取失败清空。
       showBatchReport(
@@ -456,9 +476,16 @@ document.getElementById("batch-form").addEventListener("submit", async e => {
         "）：列表暂未更新，当前显示的资料可能仍是保存前的内容；客户资料已按上述结果保存，" +
         "稍后重新打开或刷新页面即可看到最新资料，无需再次保存。</div>");
     }
-    if (refreshed) {
+    if (refreshState === "updated") {
       showBatchReport('<div class="banner ok">已成功处理 <b>' + esc(count) +
         "</b> 名客户，列表已更新，勾选已清除，字段编辑已恢复为保持原值。</div>");
+    }
+    if (refreshState === "stale") {
+      // 本次保存后的列表读取已被更新的读取取代（例如等待期间又完成了一次导入）：
+      // 表格与读取提示以最近发起的那次读取为准，这里只确认保存数量，
+      // 不断言列表已更新，也不误报读取失败。
+      showBatchReport('<div class="banner ok">已成功处理 <b>' + esc(count) +
+        "</b> 名客户，勾选已清除，字段编辑已恢复为保持原值。</div>");
     }
   } catch (err) {
     // 连接中断、没拿到任何回复：不知道服务是否已经处理并写入，不能声称资料未变
@@ -616,6 +643,8 @@ document.getElementById("import-form").addEventListener("submit", async e => {
     showReport(successReportHtml(report));
     // 成功结论只以已校验的报告为准：随后列表读取失败只附加提示，
     // 保留已确认的数量、逐条原因与原有表格，不把导入改说成失败。
+    // 若本次读取已被更新的列表读取取代（stale），表格与读取提示以最近
+    // 发起的那次为准，这里不再附加任何读取提示，已确认的报告同样不变。
     try {
       await loadClients();
     } catch (loadErr) {
