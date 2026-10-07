@@ -2,12 +2,13 @@
   "name": "clientbook-page-tests",
   "version": "1.0.0",
   "private": true,
-  "description": "ClientBook 首页页面层面回归测试（Puppeteer 驱动系统 Chrome，后端为真实 app.py）：批量修改见 page_test.mjs，CSV 导入结果展示见 import_page_test.mjs，客户列表多次读取乱序见 stale_load_test.mjs，大客户编号见 big_id_test.mjs",
+  "description": "ClientBook 首页页面层面回归测试（Puppeteer 驱动系统 Chrome，后端为真实 app.py）：批量修改见 page_test.mjs，CSV 导入结果展示见 import_page_test.mjs，客户列表多次读取乱序见 stale_load_test.mjs，大客户编号见 big_id_test.mjs，客户资料特殊字符展示见 xss_page_test.mjs",
   "scripts": {
     "test": "node page_test.mjs",
     "test:import": "node import_page_test.mjs",
     "test:stale-load": "node stale_load_test.mjs",
-    "test:big-id": "node big_id_test.mjs"
+    "test:big-id": "node big_id_test.mjs",
+    "test:xss": "node xss_page_test.mjs"
   },
   "dependencies": {
     "puppeteer": "^25.12.0"
