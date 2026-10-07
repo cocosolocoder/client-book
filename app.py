@@ -129,6 +129,14 @@ const BATCH_FIELDS = [
 
 let clients = [];
 const selected = new Set();
+// 客户列表读取的先后次序以「发起时间」为准，而不是回复到达时间：每次发起
+// GET /api/clients 都在发起时取一个递增序号，回复返回时只有序号仍是最新
+// （即此后没有发起过更新的读取）的那次才能决定表格内容、空列表说明与读取
+// 失败提示。较早发起的读取无论后到的是成功列表（含空列表）还是连接错误、
+// 非成功状态、无法解析的回复，都一律忽略：不能用导入前的旧资料覆盖已经
+// 刷新出的新客户，也不能给已更新的页面补加读取失败提示，更不能因旧列表
+// 缺少某编号而清掉当前勾选与已选客户说明。
+let listReadSeq = 0;
 // 一次批量保存从发出到本次结果处理结束期间为 true：期间只能有这一次请求，
 // 勾选变化与表单重复提交都不能解除或新增请求。
 let batchSaving = false;
@@ -150,11 +158,14 @@ function syncImportState() {
 }
 
 async function loadClients() {
+  // 序号在读取「发起」时即确定，先后次序与回复到达的早晚无关。
+  const seq = ++listReadSeq;
   // 只在明确读到有效客户列表（真正的空列表也算）时才更新页面；
   // 连接错误、非成功状态、响应无法解析或未包含 clients 数组都视为读取失败：
   // 保留此前已显示的客户编号、名称与各字段内容，不清空表格、不显示空列表提示。
   const note = document.getElementById("clients-load-error");
-  let list;
+  let list = null;
+  let failureMessage = null;
   try {
     const res = await fetch("/api/clients");
     if (!res.ok) throw new Error("服务返回非成功状态（HTTP " + res.status + "）");
@@ -167,13 +178,20 @@ async function loadClients() {
     let message = err.message;
     if (err instanceof SyntaxError) message = "响应无法解析为有效数据";
     if (err instanceof TypeError) message = "无法连接到服务（网络错误）";
-    note.textContent = "客户列表读取失败：" + message +
+    failureMessage = message;
+  }
+  // 回复到达时若已发起过更新的读取，本次（较早发起的）结果无论成功还是
+  // 失败都一律作废：不更新表格、不动空列表/读取失败提示、不按旧列表清理
+  // 勾选，也不向调用方抛错——页面内容与提示只由最近发起的读取负责。
+  if (seq !== listReadSeq) return;
+  if (failureMessage !== null) {
+    note.textContent = "客户列表读取失败：" + failureMessage +
       "，当前显示的资料可能不是最新内容；保存结果不受影响，稍后刷新页面即可重新读取。";
     note.classList.add("on");
     // 读取失败期间不能让表格或“还没有客户记录”冒充真实的空列表；
     // 此前已渲染的行保留不动，之后真正读到空列表时再由 renderClients 恢复空状态提示。
     document.getElementById("clients-empty").classList.remove("on");
-    throw new Error(message);
+    throw new Error(failureMessage);
   }
   note.classList.remove("on");
   note.textContent = "";
